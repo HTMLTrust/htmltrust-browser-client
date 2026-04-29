@@ -1,0 +1,43 @@
+{
+  "name": "@htmltrust/browser-client",
+  "version": "0.1.0",
+  "description": "Reference implementation of the HTMLTrust client-side verification and trust policy evaluation. Browser- and Node-compatible TypeScript library.",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "pretest": "npm run build",
+    "test": "node --test test/*.test.js"
+  },
+  "peerDependencies": {
+    "@htmltrust/canonicalization": "^0.2.0"
+  },
+  "dependencies": {
+    "@htmltrust/canonicalization": "file:../htmltrust-canonicalization/javascript"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.0"
+  },
+  "keywords": [
+    "htmltrust",
+    "verification",
+    "trust",
+    "signed-content",
+    "browser"
+  ],
+  "author": "Jason Grey <jason@jason-grey.com>",
+  "license": "MIT"
+}
