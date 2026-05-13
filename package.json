@@ -1,6 +1,6 @@
 {
   "name": "@htmltrust/browser-client",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Reference implementation of the HTMLTrust client-side verification and trust policy evaluation. Browser- and Node-compatible TypeScript library.",
   "type": "module",
   "main": "dist/index.js",

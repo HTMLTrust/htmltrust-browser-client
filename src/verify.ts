@@ -57,16 +57,11 @@ type ParsedSection = {
   innerHTML: string;
 };
 
-const HEX_TABLE = (() => {
-  const t = new Array<string>(256);
-  for (let i = 0; i < 256; i++) t[i] = i.toString(16).padStart(2, "0");
-  return t;
-})();
-
-function bytesToHex(bytes: Uint8Array): string {
-  let out = "";
-  for (let i = 0; i < bytes.length; i++) out += HEX_TABLE[bytes[i]];
-  return out;
+function bytesToUnpaddedBase64(bytes: Uint8Array): string {
+  // HTMLTrust spec §2.1: hashes and signatures are unpadded standard Base64.
+  let bin = "";
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin).replace(/=+$/, "");
 }
 
 async function defaultHash(canonical: string): Promise<string> {
@@ -77,7 +72,7 @@ async function defaultHash(canonical: string): Promise<string> {
     );
   }
   const buf = await subtle.digest("SHA-256", new TextEncoder().encode(canonical));
-  return bytesToHex(new Uint8Array(buf));
+  return bytesToUnpaddedBase64(new Uint8Array(buf));
 }
 
 /**
@@ -184,7 +179,7 @@ function defaultDomain(opt?: string): string {
  * Steps (spec §2.1, §3.1):
  *   1. Parse signed-section attributes and inner <meta> claim metadata.
  *   2. Apply extractCanonicalText to the innerHTML and SHA-256 hash it,
- *      prefixed as "sha256:<hex>". Compare against the embedded
+ *      prefixed as "sha256:<unpadded-base64>" per spec §2.1. Compare against the embedded
  *      content-hash attribute.
  *   3. Canonicalize claims (canonicalizeClaims) and hash them.
  *   4. Resolve keyid through the supplied resolver chain.
