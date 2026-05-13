@@ -26,12 +26,19 @@ export interface VerifyOptions {
    */
   domain?: string;
   /**
-   * Optional override for SHA-256. Receives a UTF-8 string, returns a
-   * lowercase hex digest (the implementation prefixes it with "sha256:").
-   * Provide this when SubtleCrypto is unavailable (e.g. plain HTTP origins
-   * in test harnesses).
+   * Optional override for SHA-256. Receives a UTF-8 string, returns the
+   * digest as unpadded Base64 per HTMLTrust spec §2.1 (the implementation
+   * prefixes it with "sha256:"). Provide this when SubtleCrypto is
+   * unavailable (e.g. plain HTTP origins in test harnesses).
    */
   hash?: (canonical: string) => Promise<string>;
+  /**
+   * When true, write a console.warn diagnostic each time verification
+   * fails, including the canonical text, computed vs embedded hashes, and
+   * the signature binding. Useful for debugging signer/verifier
+   * mismatches in production deployments.
+   */
+  debug?: boolean;
 }
 
 export interface VerifyResult {
@@ -209,10 +216,19 @@ export async function verifySignedSection(
     ...partial,
   });
 
-  if (!parsed) return empty("missing required attributes");
+  const debug = options.debug === true;
+  const warn = (reason: string, details: Record<string, unknown>) => {
+    if (debug) console.warn("[htmltrust] verify failed:", reason, details);
+  };
+
+  if (!parsed) {
+    warn("missing required attributes", { input: typeof section === "string" ? section.slice(0, 200) : "(Element)" });
+    return empty("missing required attributes");
+  }
 
   const { signature, keyid, contentHashAttr, algorithm, signedAt, claims, innerHTML } = parsed;
   if (!signature || !keyid || !contentHashAttr || !signedAt) {
+    warn("missing required attributes", { signature: !!signature, keyid, contentHashAttr, signedAt });
     return empty("missing required attributes");
   }
 
@@ -220,6 +236,15 @@ export async function verifySignedSection(
   const canonicalContent = extractCanonicalText(innerHTML);
   const computedContentHash = `sha256:${await hashFn(canonicalContent)}`;
   if (computedContentHash !== contentHashAttr) {
+    warn("content hash mismatch", {
+      embeddedContentHash: contentHashAttr,
+      computedContentHash,
+      canonicalTextLength: canonicalContent.length,
+      canonicalTextHead: canonicalContent.slice(0, 200),
+      canonicalTextTail: canonicalContent.slice(-200),
+      innerHTMLLength: innerHTML.length,
+      innerHTMLHead: innerHTML.slice(0, 200),
+    });
     return empty("content hash mismatch");
   }
 
@@ -232,12 +257,15 @@ export async function verifySignedSection(
   // as a returned-null: "key not resolvable". Errors that bubble out of the
   // resolver chain are not the verifier's responsibility to surface.
   let resolved = null;
+  let resolverError: unknown = null;
   try {
     resolved = await resolveKey(keyid, options.keyResolvers);
-  } catch {
+  } catch (e) {
+    resolverError = e;
     resolved = null;
   }
   if (!resolved) {
+    warn("key not resolvable", { keyid, resolverError: resolverError instanceof Error ? resolverError.message : resolverError });
     return empty("key not resolvable", { claimsHash });
   }
 
@@ -256,6 +284,13 @@ export async function verifySignedSection(
   );
 
   if (!sigOk) {
+    warn("signature invalid", {
+      binding,
+      signature,
+      keyid,
+      algorithm: resolved.algorithm || algorithm,
+      publicKeyPemHead: resolved.publicKeyPem.slice(0, 80),
+    });
     return empty("signature invalid", {
       claimsHash,
       algorithm: resolved.algorithm || algorithm,
