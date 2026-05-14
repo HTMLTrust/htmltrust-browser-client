@@ -129,8 +129,40 @@ function parseSection(input: Element | string): ParsedSection | null {
 
 const SIGNED_SECTION_RE =
   /<signed-section\b([^>]*)>([\s\S]*?)<\/signed-section\s*>/i;
+const SIGNED_SECTION_RE_GLOBAL =
+  /<signed-section\b([^>]*)>([\s\S]*?)<\/signed-section\s*>/gi;
 const ATTR_RE = /([a-z][a-z0-9-]*)\s*=\s*"([^"]*)"|([a-z][a-z0-9-]*)\s*=\s*'([^']*)'/gi;
 const META_RE = /<meta\b([^>]*)\/?>(?:\s*<\/meta\s*>)?/gi;
+
+/**
+ * Extract every `<signed-section>...</signed-section>` substring from a
+ * document HTML string, in document order. Each returned string is the
+ * full element (open tag through close tag), suitable for passing to
+ * `verifySignedSection` as the string-shaped input.
+ *
+ * Use this when you need to verify against the **original served HTML**
+ * rather than the live DOM — e.g. on pages whose client-side scripts
+ * mutate content inside signed regions (Hugo Blox copy-button injection,
+ * runtime syntax highlighters, lazy-loaders). Verifying the pristine
+ * HTML keeps content-hash comparison deterministic regardless of what
+ * other scripts on the page do to the DOM after load.
+ *
+ * Position-paired against the live DOM by document order: the i-th
+ * extracted string corresponds to the i-th `<signed-section>` element
+ * in the page.
+ */
+export function extractSignedSections(html: string): string[] {
+  if (typeof html !== "string") {
+    throw new TypeError("extractSignedSections expects a string");
+  }
+  const out: string[] = [];
+  SIGNED_SECTION_RE_GLOBAL.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = SIGNED_SECTION_RE_GLOBAL.exec(html))) {
+    out.push(m[0]);
+  }
+  return out;
+}
 
 function parseAttrs(attrSrc: string): Record<string, string> {
   const out: Record<string, string> = {};
