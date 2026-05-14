@@ -7,7 +7,7 @@
  * Plus endorsement fetching/verification (§2.5) and resolver helpers.
  */
 
-export { verifySignedSection } from "./verify.js";
+export { verifySignedSection, extractSignedSections } from "./verify.js";
 export type { VerifyOptions, VerifyResult } from "./verify.js";
 
 export { evaluateTrustPolicy } from "./policy.js";
