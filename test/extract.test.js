@@ -72,9 +72,9 @@ test("extractSignedSections: returned strings round-trip through verifySignedSec
     </signed-section>
   </html>`;
   const [slice] = extractSignedSections(html);
-  // Verify against a do-nothing resolver — we expect "key not resolvable"
-  // (not "missing required attributes"), which confirms the slice parsed.
-  const result = await verifySignedSection(slice, { domain: "x.example", keyResolvers: [] });
+  // Verify against a do-nothing resolver. A content-hash mismatch confirms
+  // the slice parsed far enough to reach canonical verification.
+  const result = await verifySignedSection(slice, { domain: "https://x.example", keyResolvers: [] });
   assert.equal(result.valid, false);
-  assert.equal(result.reason, "content hash mismatch");
+  assert.equal(result.reason, "content-hash-mismatch");
 });

@@ -7,17 +7,15 @@
  */
 
 import {
-  didWebResolver,
-  directUrlResolver,
-  trustDirectoryResolver,
+  didWebResolver as canonicalDidWebResolver,
+  directUrlResolver as canonicalDirectUrlResolver,
+  trustDirectoryResolver as canonicalTrustDirectoryResolver,
   resolveKey,
 } from "@htmltrust/canonicalization";
 import type { KeyResolver } from "@htmltrust/canonicalization";
+import { isLoopbackHost, isPrivateHost, makeVerificationFetch } from "./spec.js";
 
 export {
-  didWebResolver,
-  directUrlResolver,
-  trustDirectoryResolver,
   resolveKey,
 };
 
@@ -26,6 +24,44 @@ export interface DefaultResolverChainOptions {
   directories?: string[];
   /** Optional fetch override (for tests, custom transports, etc.). */
   fetch?: typeof fetch;
+  /** Allows http://127.0.0.1 fixture URLs in tests. Do not enable in production. */
+  allowInsecureHttpForTesting?: boolean;
+}
+
+export type ResolverOptions = Omit<DefaultResolverChainOptions, "directories">;
+
+export interface TrustDirectoryResolverOptions extends ResolverOptions {
+  baseUrls: string[];
+}
+
+export function didWebResolver(opts: ResolverOptions = {}): KeyResolver {
+  return canonicalDidWebResolver({
+    fetch: makeVerificationFetch(opts),
+  });
+}
+
+export function directUrlResolver(opts: ResolverOptions = {}): KeyResolver {
+  return canonicalDirectUrlResolver({
+    fetch: makeVerificationFetch(opts),
+  });
+}
+
+export function trustDirectoryResolver(opts: TrustDirectoryResolverOptions): KeyResolver {
+  for (const base of opts.baseUrls) {
+    const url = new URL(base);
+    const testingLoopback =
+      opts.allowInsecureHttpForTesting === true && isLoopbackHost(url.hostname);
+    if (url.protocol !== "https:" && !testingLoopback) {
+      throw new Error("network-policy-blocked");
+    }
+    if (isPrivateHost(url.hostname) && !testingLoopback) {
+      throw new Error("network-policy-blocked");
+    }
+  }
+  return canonicalTrustDirectoryResolver({
+    baseUrls: opts.baseUrls,
+    fetch: makeVerificationFetch(opts),
+  });
 }
 
 /**
@@ -40,13 +76,13 @@ export interface DefaultResolverChainOptions {
 export function defaultResolverChain(
   opts: DefaultResolverChainOptions = {},
 ): KeyResolver[] {
-  const { directories = [], fetch: fetchImpl } = opts;
+  const { directories = [], fetch: fetchImpl, allowInsecureHttpForTesting } = opts;
   const chain: KeyResolver[] = [
-    didWebResolver({ fetch: fetchImpl }),
-    directUrlResolver({ fetch: fetchImpl }),
+    didWebResolver({ fetch: fetchImpl, allowInsecureHttpForTesting }),
+    directUrlResolver({ fetch: fetchImpl, allowInsecureHttpForTesting }),
   ];
   if (directories.length > 0) {
-    chain.push(trustDirectoryResolver({ baseUrls: directories, fetch: fetchImpl }));
+    chain.push(trustDirectoryResolver({ baseUrls: directories, fetch: fetchImpl, allowInsecureHttpForTesting }));
   }
   return chain;
 }

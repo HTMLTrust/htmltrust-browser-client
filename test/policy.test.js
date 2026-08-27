@@ -18,13 +18,15 @@ function vr(partial = {}) {
     claimsHash: "sha256:def",
     claims: {},
     signedAt: "2026-04-28T00:00:00Z",
-    domain: "alice.example",
+    domain: "https://alice.example",
+    origin: "https://alice.example",
+    inputState: "rendered-match",
     ...partial,
   };
 }
 
 test("invalid signature → score 0, red, single input", async () => {
-  const ev = await evaluateTrustPolicy(vr({ valid: false, reason: "signature invalid" }), {});
+  const ev = await evaluateTrustPolicy(vr({ valid: false, reason: "signature-invalid" }), {});
   assert.equal(ev.score, 0);
   assert.equal(ev.indicator, "red");
   assert.equal(ev.inputs.length, 1);
@@ -47,7 +49,7 @@ test("personal trust list adds 40 → 90, green", async () => {
 
 test("trusted domain adds 30 → 80, green", async () => {
   const ev = await evaluateTrustPolicy(vr(), {
-    trustedDomains: ["alice.example"],
+    trustedDomains: ["https://alice.example"],
   });
   assert.equal(ev.score, 80);
   assert.equal(ev.indicator, "green");
@@ -56,7 +58,7 @@ test("trusted domain adds 30 → 80, green", async () => {
 test("personal + domain → clamps at 100, green", async () => {
   const ev = await evaluateTrustPolicy(vr(), {
     personalTrustList: ["did:web:alice.example"],
-    trustedDomains: ["alice.example"],
+    trustedDomains: ["https://alice.example"],
   });
   assert.equal(ev.score, 100);
   assert.equal(ev.indicator, "green");
@@ -118,7 +120,7 @@ test("any directory reports → indicator forced to red (override)", async () =>
   try {
     const ev = await evaluateTrustPolicy(vr(), {
       personalTrustList: ["did:web:alice.example"],
-      trustedDomains: ["alice.example"],
+      trustedDomains: ["https://alice.example"],
       directorySubscriptions: [{ url: base, weight: 1.0 }],
     });
     assert.equal(ev.score, 100); // numeric score still maxed

@@ -30,7 +30,7 @@ export function generateKey() {
 }
 
 export function signEd25519(privateKey, message) {
-  return nodeSign(null, Buffer.from(message, "utf8"), privateKey).toString("base64");
+  return nodeSign(null, Buffer.from(message, "utf8"), privateKey).toString("base64").replace(/=+$/, "");
 }
 
 export function startServer(routes) {

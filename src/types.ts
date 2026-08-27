@@ -8,6 +8,5 @@
 export type {
   KeyResolver,
   ResolvedKey,
-  Endorsement,
   SignatureBindingParts,
 } from "@htmltrust/canonicalization";

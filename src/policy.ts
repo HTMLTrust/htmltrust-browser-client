@@ -22,7 +22,7 @@ export interface DirectorySubscription {
 export interface TrustPolicy {
   /** Personal trust list of keyids (option A in the spec). */
   personalTrustList?: string[];
-  /** Trusted domains (option B in the spec). */
+  /** Trusted publication origins (legacy option name retained). */
   trustedDomains?: string[];
   /** Trust directory subscriptions, each with a weight. */
   directorySubscriptions?: DirectorySubscription[];
@@ -100,7 +100,7 @@ function indicatorFor(
  *   - Otherwise, start at 50 (neutral baseline for a verified-but-unknown
  *     signer), then add:
  *       +40 if keyid is in personalTrustList
- *       +30 if domain is in trustedDomains
+ *       +30 if origin/domain is in trustedDomains
  *       For each directory subscription, GET reputation and add
  *         (trustScore - 0.5) * weight * 40 to the score.
  *   - Clamp to 0..100, map to indicator via thresholds.
@@ -148,7 +148,7 @@ export async function evaluateTrustPolicy(
     inputs.push({
       source: "trustedDomains",
       contribution: 30,
-      rationale: `domain ${verifyResult.domain} is in trusted domain list`,
+      rationale: `origin ${verifyResult.domain} is in trusted domain list`,
     });
   }
 

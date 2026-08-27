@@ -7,7 +7,7 @@
  * Plus endorsement fetching/verification (§2.5) and resolver helpers.
  */
 
-export { verifySignedSection, extractSignedSections } from "./verify.js";
+export { verifySignedSection, extractSignedSections, canonicalizeSignedContent } from "./verify.js";
 export type { VerifyOptions, VerifyResult } from "./verify.js";
 
 export { evaluateTrustPolicy } from "./policy.js";
@@ -18,8 +18,17 @@ export type {
   DirectorySubscription,
 } from "./policy.js";
 
-export { fetchEndorsements } from "./endorsements.js";
-export type { FetchEndorsementsOptions } from "./endorsements.js";
+export {
+  fetchEndorsements,
+  fetchEndorsementsWithFailures,
+  verifyStructuredEndorsement,
+} from "./endorsements.js";
+export type {
+  EndorsementFetchFailure,
+  FetchEndorsementsOptions,
+  FetchEndorsementsResult,
+  StructuredEndorsement,
+} from "./endorsements.js";
 
 export {
   didWebResolver,
@@ -28,11 +37,19 @@ export {
   resolveKey,
   defaultResolverChain,
 } from "./resolver.js";
-export type { DefaultResolverChainOptions } from "./resolver.js";
+export type {
+  DefaultResolverChainOptions,
+  ResolverOptions,
+  TrustDirectoryResolverOptions,
+} from "./resolver.js";
 
 export type {
   KeyResolver,
   ResolvedKey,
-  Endorsement,
   SignatureBindingParts,
 } from "./types.js";
+export { isLoopbackHost, isPrivateHost } from "./spec.js";
+export type {
+  VerificationFailureReason,
+  VerificationInputState,
+} from "./spec.js";
