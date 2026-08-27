@@ -2,6 +2,23 @@
 
 Reference implementation of the HTMLTrust client-side verification and trust policy evaluation, as a language-neutral TypeScript library that can be used in browsers, Node.js crawlers, test harnesses, and any other verifying client.
 
+## Quick start
+
+Requirements: Node.js 22 or newer and npm.
+
+Install from a fresh clone, run the Node test suite, check types, and build the package:
+
+```sh
+git clone https://github.com/HTMLTrust/htmltrust-browser-client.git
+cd htmltrust-browser-client
+npm ci
+npm test
+npm run typecheck
+npm run build
+```
+
+The build writes JavaScript, declarations, and source maps to `dist/`. The package downloads the pinned v0.2.2 canonicalization source from its public release archive, so this repository can be cloned and installed by itself.
+
 ## Status
 
 Reference TypeScript implementation for browser-client verification and policy evaluation. The API is still draft-aligned and may change with the HTMLTrust specifications.
@@ -84,21 +101,22 @@ const detailed = await fetchEndorsementsWithFailures(contentHash, {
 // detailed.failures carries spec-style reasons such as "directory-unavailable".
 ```
 
-## Planned dependencies
+## Runtime requirements
 
 - Web standard `crypto.subtle` (SubtleCrypto) in browsers
 - Node `node:crypto.webcrypto` in Node.js
 - `@htmltrust/canonicalization` for text normalization and HTML text extraction
-- No other runtime dependencies
+- No other runtime dependencies are required.
 
-## Conformance
+## Tests
 
-A single test suite runs against this library in:
+The test suite runs with Node's built-in test runner against the compiled package:
 
-1. Browser environment (Playwright)
-2. Node environment
+```sh
+npm test
+```
 
-Both MUST produce identical verification results for every vector in a shared test fixture set.
+`npm test` builds `dist/` first, then runs the tests in `test/`. `npm run typecheck` checks the TypeScript sources without emitting files. This repository does not currently contain Playwright tests or a browser conformance fixture suite.
 
 ## License
 
