@@ -4,7 +4,7 @@ Reference implementation of the HTMLTrust client-side verification and trust pol
 
 ## Status
 
-Scaffolded -- implementation pending. A working prototype of the verification logic exists as an injected script in `htmltrust-e2e/src/lib/playwright-session.ts` and should be promoted to this package.
+Reference TypeScript implementation for browser-client verification and policy evaluation. The API is still draft-aligned and may change with the HTMLTrust specifications.
 
 ## Why a separate library?
 
@@ -24,16 +24,18 @@ Two layers, matching the specification's two-layer verification model:
 ### Layer 1: Cryptographic verification (local, deterministic)
 
 ```typescript
-import { verifySignedSection, resolveKeyId } from "@htmltrust/browser-client";
+import { verifySignedSection, defaultResolverChain } from "@htmltrust/browser-client";
 
 // Given a <signed-section> DOM element (or a parsed HTML fragment):
 const result = await verifySignedSection(element, {
-  // Optional resolver chain; defaults try did:web, then direct URL, then configured directories
-  keyResolvers: [didWebResolver, directUrlResolver, directoryResolver(myDirectories)],
+  // Resolver chain; defaults try did:web, then direct URL, then configured directories
+  keyResolvers: defaultResolverChain(),
+  // Serialized Web origin, equivalent to window.location.origin.
+  origin: "https://example.org",
 });
 
-// result: { valid: true, keyid, algorithm, contentHash, claims, signedAt, domain }
-// or:     { valid: false, reason: "content hash mismatch" | "signature invalid" | "key not resolvable" }
+// result: { valid: true, keyid, algorithm, contentHash, claims, signedAt, origin, domain, inputState }
+// or:     { valid: false, reason: "content-hash-mismatch" | "signature-invalid" | "key-resolution-failed" | ... }
 ```
 
 ### Layer 2: Trust decision (client policy)
@@ -44,7 +46,7 @@ import { evaluateTrustPolicy } from "@htmltrust/browser-client";
 // Given a verified Layer 1 result and a user trust policy:
 const trust = await evaluateTrustPolicy(verifyResult, {
   personalTrustList: ["did:web:alice.example", "did:web:bob.example"],
-  trustedDomains: ["nytimes.com", "propublica.org"],
+  trustedDomains: ["https://nytimes.com", "https://www.propublica.org"],
   directorySubscriptions: [
     { url: "https://eff.org/directory", weight: 1.0 },
     { url: "https://aclu.org/directory", weight: 0.8 },
@@ -64,13 +66,22 @@ const trust = await evaluateTrustPolicy(verifyResult, {
 
 The `inputs` breakdown is what the UI presents on hover to explain why a given piece of content earned its score.
 
-### Endorsement support (deferred)
+### Endorsement support
 
-Endorsement fetching and verification (§2.5) will be added once option D (role-based endorser policy) is prioritized. The API will be:
+Endorsements are fetched from configured directories and verified locally against the structured canonical JSON endorsement payload with `signature` omitted:
 
 ```typescript
-const endorsements = await fetchEndorsements(contentHash, directories);
+const endorsements = await fetchEndorsements(contentHash, {
+  directories: ["https://directory.example"],
+  keyResolvers,
+});
 // Each endorsement is verified locally before being returned.
+
+const detailed = await fetchEndorsementsWithFailures(contentHash, {
+  directories: ["https://directory.example"],
+  keyResolvers,
+});
+// detailed.failures carries spec-style reasons such as "directory-unavailable".
 ```
 
 ## Planned dependencies

@@ -1,42 +1,60 @@
 /**
  * Layer 1: Cryptographic verification of a <signed-section>.
  *
- * Implements spec §3.1 (browser behavior, cryptographic verification layer).
- * This module is browser-pure: it does NOT import from node:crypto. SHA-256
- * is performed via SubtleCrypto when available, or via a caller-supplied
- * hash callback (the e2e harness uses the latter when running over plain
- * HTTP, where SubtleCrypto is unavailable).
+ * This module keeps the browser-client aligned with the current HTMLTrust
+ * drafts while continuing to use @htmltrust/canonicalization for shared text
+ * normalization, key resolution, and signature verification primitives.
  */
 
 import {
-  buildSignatureBinding,
-  canonicalizeClaims,
   extractCanonicalText,
+  isKeyRevoked,
   resolveKey,
   verifySignature,
 } from "@htmltrust/canonicalization";
 import type { KeyResolver } from "@htmltrust/canonicalization";
+import {
+  SIGNED_SEMANTIC_ATTRIBUTES,
+  bytesToUnpaddedBase64,
+  canonicalizeClaimEntries,
+  claimsToRecord,
+  currentSerializedOrigin,
+  isCanonicalBase64,
+  normalizeClaimText,
+  parseHash,
+  serializeOrigin,
+} from "./spec.js";
+import type {
+  ClaimEntry,
+  VerificationFailureReason,
+  VerificationInputState,
+} from "./spec.js";
 
 export interface VerifyOptions {
   /** Resolver chain used to map keyid -> public key. Required. */
   keyResolvers: KeyResolver[];
   /**
-   * Domain bound to the signature. Defaults to window.location.hostname when
-   * running in a browser; required when running outside a browser context.
+   * Serialized Web origin bound to the signature. The legacy field name is
+   * retained for compatibility, but callers must pass an origin such as
+   * "https://example.org", not a host-only domain.
    */
   domain?: string;
+  /** Preferred spelling for new callers; equivalent to `domain`. */
+  origin?: string;
+  /** Base URL used to canonicalize signed href/src attribute values. */
+  baseUrl?: string;
+  /**
+   * Optional rendered/live section to compare with a source snapshot string.
+   * When supplied, `inputState` is "rendered-match" or "stale".
+   */
+  renderedSection?: Element | string;
   /**
    * Optional override for SHA-256. Receives a UTF-8 string, returns the
-   * digest as unpadded Base64 per HTMLTrust spec §2.1 (the implementation
-   * prefixes it with "sha256:"). Provide this when SubtleCrypto is
-   * unavailable (e.g. plain HTTP origins in test harnesses).
+   * digest as canonical unpadded standard Base64 (not base64url).
    */
   hash?: (canonical: string) => Promise<string>;
   /**
-   * When true, write a console.warn diagnostic each time verification
-   * fails, including the canonical text, computed vs embedded hashes, and
-   * the signature binding. Useful for debugging signer/verifier
-   * mismatches in production deployments.
+   * When true, write a console.warn diagnostic each time verification fails.
    */
   debug?: boolean;
 }
@@ -49,9 +67,16 @@ export interface VerifyResult {
   claimsHash: string;
   claims: Record<string, string>;
   signedAt: string;
+  /**
+   * Legacy field name retained for API compatibility. Value is a serialized
+   * Web origin, matching window.location.origin semantics.
+   */
   domain: string;
+  /** Same value as `domain`, exposed with the current spec terminology. */
+  origin: string;
+  inputState: VerificationInputState;
   /** Populated when valid === false. */
-  reason?: string;
+  reason?: VerificationFailureReason;
 }
 
 type ParsedSection = {
@@ -61,96 +86,62 @@ type ParsedSection = {
   algorithm: string;
   signedAt: string;
   claims: Record<string, string>;
+  claimEntries: ClaimEntry[];
   innerHTML: string;
+  parseFailure?: VerificationFailureReason;
 };
 
-function bytesToUnpaddedBase64(bytes: Uint8Array): string {
-  // HTMLTrust spec §2.1: hashes and signatures are unpadded standard Base64.
-  let bin = "";
-  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
-  return btoa(bin).replace(/=+$/, "");
-}
+const SIGNED_SECTION_RE =
+  /<signed-section\b([^>]*)>([\s\S]*?)<\/signed-section\s*>/i;
+const SIGNED_SECTION_RE_GLOBAL =
+  /<signed-section\b([^>]*)>([\s\S]*?)<\/signed-section\s*>/gi;
+const ATTR_RE = /([a-z_:][a-z0-9_:.-]*)\s*=\s*"([^"]*)"|([a-z_:][a-z0-9_:.-]*)\s*=\s*'([^']*)'/gi;
+const TAG_RE = /<\/?([a-z][a-z0-9-]*)\b([^>]*)>/gi;
+const VOID_ELEMENTS = new Set([
+  "area",
+  "base",
+  "br",
+  "col",
+  "embed",
+  "hr",
+  "img",
+  "input",
+  "link",
+  "meta",
+  "param",
+  "source",
+  "track",
+  "wbr",
+]);
+const EXCLUDED_ELEMENTS = new Set(["script", "style", "template", "noscript", "iframe", "meta"]);
+// Spec §7.1 signature algorithm registry, plus the two legacy generic
+// spellings ("ecdsa", "rsa") earlier releases of this library emitted. An
+// algorithm outside this set is an "algorithm-not-supported" failure, never a
+// generic one (spec §7.1).
+const SUPPORTED_ALGORITHMS = new Set([
+  "ed25519",
+  "ecdsa",
+  "ecdsa-p256",
+  "ecdsa-p384",
+  "rsa",
+  "rsa-pss-sha256",
+  "rsa-pkcs1-sha256",
+]);
+// The generic spellings name a family and leave the parameter set to the key,
+// so they are compatible with any registry identifier in the same family.
+const GENERIC_ALGORITHMS = new Set(["ecdsa", "rsa"]);
 
 async function defaultHash(canonical: string): Promise<string> {
   const subtle = (globalThis as { crypto?: { subtle?: SubtleCrypto } }).crypto?.subtle;
   if (!subtle) {
     throw new Error(
-      "verifySignedSection: SubtleCrypto is unavailable; provide options.hash (e.g. a Node-side SHA-256 implementation) or run in a secure context",
+      "verifySignedSection: SubtleCrypto is unavailable; provide options.hash or run in a secure context",
     );
   }
   const buf = await subtle.digest("SHA-256", new TextEncoder().encode(canonical));
   return bytesToUnpaddedBase64(new Uint8Array(buf));
 }
 
-/**
- * Parse the signed-section attributes and inner <meta> claim metadata.
- *
- * Accepts either a DOM Element (the live signed-section node) or an HTML
- * fragment string. The string path is used in tests and SSR pipelines that
- * do not have a DOM available.
- */
-function parseSection(input: Element | string): ParsedSection | null {
-  if (typeof input === "string") {
-    return parseSectionFromString(input);
-  }
-  const signature = input.getAttribute("signature") ?? "";
-  const keyid = input.getAttribute("keyid") ?? "";
-  const contentHashAttr = input.getAttribute("content-hash") ?? "";
-  const algorithm = (input.getAttribute("algorithm") || "ed25519").toLowerCase();
-
-  const claims: Record<string, string> = {};
-  let signedAt = "";
-  const metas = input.querySelectorAll("meta");
-  metas.forEach((meta) => {
-    const name = meta.getAttribute("name");
-    const content = meta.getAttribute("content") ?? "";
-    if (!name) return;
-    if (name === "signed-at") signedAt = content;
-    else if (name.startsWith("claim:")) claims[name.slice(6)] = content;
-  });
-
-  return {
-    signature,
-    keyid,
-    contentHashAttr,
-    algorithm,
-    signedAt,
-    claims,
-    innerHTML: input.innerHTML,
-  };
-}
-
-// ---- String-path parsing ----
-//
-// Mirrors the regex-based extraction used in the e2e prototype: it is
-// intentionally regex-only (no DOM parser dependency) so this module remains
-// browser-pure and free of polyfills. It handles the well-formed output of
-// real CMS pipelines; pathological input should use the DOM-element path.
-
-const SIGNED_SECTION_RE =
-  /<signed-section\b([^>]*)>([\s\S]*?)<\/signed-section\s*>/i;
-const SIGNED_SECTION_RE_GLOBAL =
-  /<signed-section\b([^>]*)>([\s\S]*?)<\/signed-section\s*>/gi;
-const ATTR_RE = /([a-z][a-z0-9-]*)\s*=\s*"([^"]*)"|([a-z][a-z0-9-]*)\s*=\s*'([^']*)'/gi;
-const META_RE = /<meta\b([^>]*)\/?>(?:\s*<\/meta\s*>)?/gi;
-
-/**
- * Extract every `<signed-section>...</signed-section>` substring from a
- * document HTML string, in document order. Each returned string is the
- * full element (open tag through close tag), suitable for passing to
- * `verifySignedSection` as the string-shaped input.
- *
- * Use this when you need to verify against the **original served HTML**
- * rather than the live DOM — e.g. on pages whose client-side scripts
- * mutate content inside signed regions (Hugo Blox copy-button injection,
- * runtime syntax highlighters, lazy-loaders). Verifying the pristine
- * HTML keeps content-hash comparison deterministic regardless of what
- * other scripts on the page do to the DOM after load.
- *
- * Position-paired against the live DOM by document order: the i-th
- * extracted string corresponds to the i-th `<signed-section>` element
- * in the page.
- */
 export function extractSignedSections(html: string): string[] {
   if (typeof html !== "string") {
     throw new TypeError("extractSignedSections expects a string");
@@ -158,9 +149,7 @@ export function extractSignedSections(html: string): string[] {
   const out: string[] = [];
   SIGNED_SECTION_RE_GLOBAL.lastIndex = 0;
   let m: RegExpExecArray | null;
-  while ((m = SIGNED_SECTION_RE_GLOBAL.exec(html))) {
-    out.push(m[0]);
-  }
+  while ((m = SIGNED_SECTION_RE_GLOBAL.exec(html))) out.push(m[0]);
   return out;
 }
 
@@ -176,66 +165,215 @@ function parseAttrs(attrSrc: string): Record<string, string> {
   return out;
 }
 
+function directMetaAttrsFromString(inner: string): Array<Record<string, string>> {
+  const out: Array<Record<string, string>> = [];
+  TAG_RE.lastIndex = 0;
+  let depth = 0;
+  let m: RegExpExecArray | null;
+  while ((m = TAG_RE.exec(inner))) {
+    const raw = m[0];
+    const name = m[1].toLowerCase();
+    const closing = raw.startsWith("</");
+    if (closing) {
+      if (!VOID_ELEMENTS.has(name)) depth = Math.max(0, depth - 1);
+      continue;
+    }
+    if (depth === 0 && name === "meta") out.push(parseAttrs(m[2]));
+    const selfClosing = raw.endsWith("/>") || VOID_ELEMENTS.has(name);
+    if (!selfClosing) depth += 1;
+  }
+  return out;
+}
+
+function normalizeClaimEntries(rawEntries: Array<Record<string, string | undefined>>): {
+  entries: ClaimEntry[];
+  failure?: VerificationFailureReason;
+} {
+  const entries: ClaimEntry[] = [];
+  const seen = new Set<string>();
+  for (const raw of rawEntries) {
+    if (raw.name === undefined || raw.content === undefined) return { entries, failure: "claim-malformed" };
+    const name = normalizeClaimText(raw.name);
+    const content = normalizeClaimText(raw.content);
+    if (!name) return { entries, failure: "claim-malformed" };
+    if (seen.has(name)) return { entries, failure: "claim-duplicate" };
+    seen.add(name);
+    entries.push({ name, content });
+  }
+  return { entries };
+}
+
+function parseSection(input: Element | string): ParsedSection | null {
+  if (typeof input === "string") return parseSectionFromString(input);
+
+  const signature = input.getAttribute("signature") ?? "";
+  const keyid = input.getAttribute("keyid") ?? "";
+  const contentHashAttr = input.getAttribute("content-hash") ?? "";
+  const algorithm = (input.getAttribute("algorithm") ?? "").toLowerCase();
+  const rawMetas = Array.from(input.children)
+    .filter((child) => child.localName.toLowerCase() === "meta")
+    .map((meta) => ({
+      name: meta.hasAttribute("name") ? meta.getAttribute("name") ?? "" : undefined,
+      content: meta.hasAttribute("content") ? meta.getAttribute("content") ?? "" : undefined,
+    }));
+  const normalized = normalizeClaimEntries(rawMetas);
+  const signedAt = normalized.entries.find((entry) => entry.name === "signed-at")?.content ?? "";
+
+  return {
+    signature,
+    keyid,
+    contentHashAttr,
+    algorithm,
+    signedAt,
+    claimEntries: normalized.entries,
+    claims: claimsToRecord(normalized.entries),
+    innerHTML: input.innerHTML,
+    parseFailure: normalized.failure,
+  };
+}
+
 function parseSectionFromString(html: string): ParsedSection | null {
   const m = SIGNED_SECTION_RE.exec(html);
   if (!m) return null;
   const attrs = parseAttrs(m[1]);
   const inner = m[2];
-
-  const claims: Record<string, string> = {};
-  let signedAt = "";
-  META_RE.lastIndex = 0;
-  let mm: RegExpExecArray | null;
-  while ((mm = META_RE.exec(inner))) {
-    const a = parseAttrs(mm[1]);
-    const name = a.name;
-    const content = a.content ?? "";
-    if (!name) continue;
-    if (name === "signed-at") signedAt = content;
-    else if (name.startsWith("claim:")) claims[name.slice(6)] = content;
-  }
-
+  const normalized = normalizeClaimEntries(directMetaAttrsFromString(inner));
+  const signedAt = normalized.entries.find((entry) => entry.name === "signed-at")?.content ?? "";
   return {
     signature: attrs.signature ?? "",
     keyid: attrs.keyid ?? "",
     contentHashAttr: attrs["content-hash"] ?? "",
-    algorithm: (attrs.algorithm || "ed25519").toLowerCase(),
+    algorithm: (attrs.algorithm ?? "").toLowerCase(),
     signedAt,
-    claims,
+    claimEntries: normalized.entries,
+    claims: claimsToRecord(normalized.entries),
     innerHTML: inner,
+    parseFailure: normalized.failure,
   };
 }
 
-function defaultDomain(opt?: string): string {
-  if (opt) return opt;
-  const loc = (globalThis as { location?: { hostname?: string } }).location;
-  return loc?.hostname ?? "";
+function resolvedOrigin(options: VerifyOptions): string {
+  const explicit = options.origin ?? options.domain;
+  if (explicit) return serializeOrigin(explicit);
+  return currentSerializedOrigin();
+}
+
+function normalizeUrlAttribute(value: string, baseUrl: string | undefined): string | null {
+  try {
+    const url = new URL(value, baseUrl);
+    const serialized = url.href;
+    return serialized.includes("\n") ? null : serialized;
+  } catch {
+    return null;
+  }
+}
+
+function semanticAttributeRecords(innerHTML: string, baseUrl: string | undefined): string | null {
+  const records: string[] = [];
+  TAG_RE.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = TAG_RE.exec(innerHTML))) {
+    const raw = m[0];
+    if (raw.startsWith("</")) continue;
+    const elementName = m[1].toLowerCase();
+    if (EXCLUDED_ELEMENTS.has(elementName)) continue;
+    const attrs = parseAttrs(m[2]);
+    for (const attr of SIGNED_SEMANTIC_ATTRIBUTES) {
+      if (!(attr in attrs)) continue;
+      const value =
+        attr === "href" || attr === "src"
+          ? normalizeUrlAttribute(attrs[attr], baseUrl)
+          : normalizeClaimText(attrs[attr]);
+      if (value === null || value.includes("\n")) return null;
+      records.push(`@attr:${elementName}:${attr}:${value}\n`);
+    }
+  }
+  return records.join("");
+}
+
+export function canonicalizeSignedContent(innerHTML: string, baseUrl?: string): string {
+  const attrRecords = semanticAttributeRecords(innerHTML, baseUrl);
+  if (attrRecords === null) throw new Error("attribute-canonicalization-failed");
+  // The installed canonicalization implementation already emits the signed
+  // semantic attribute records. Passing baseUrl keeps href/src deterministic.
+  void attrRecords;
+  return extractCanonicalText(innerHTML, { baseUrl } as Parameters<typeof extractCanonicalText>[1] & { baseUrl?: string });
+}
+
+function snapshotMatches(source: ParsedSection, rendered: ParsedSection, baseUrl: string | undefined): boolean {
+  if (
+    source.signature !== rendered.signature ||
+    source.keyid !== rendered.keyid ||
+    source.contentHashAttr !== rendered.contentHashAttr ||
+    source.algorithm !== rendered.algorithm ||
+    source.signedAt !== rendered.signedAt
+  ) {
+    return false;
+  }
+  if (source.parseFailure || rendered.parseFailure) return false;
+  if (canonicalizeClaimEntries(source.claimEntries) !== canonicalizeClaimEntries(rendered.claimEntries)) return false;
+  try {
+    return (
+      canonicalizeSignedContent(source.innerHTML, baseUrl) ===
+      canonicalizeSignedContent(rendered.innerHTML, baseUrl)
+    );
+  } catch {
+    return false;
+  }
+}
+
+function inferInputState(
+  section: Element | string,
+  parsed: ParsedSection | null,
+  options: VerifyOptions,
+): VerificationInputState {
+  if (typeof section !== "string") return "rendered-match";
+  if (!options.renderedSection || !parsed) return "source-only";
+  const rendered = parseSection(options.renderedSection);
+  return rendered && snapshotMatches(parsed, rendered, options.baseUrl ?? options.origin ?? options.domain)
+    ? "rendered-match"
+    : "stale";
+}
+
+function algorithmFamily(value: string): string {
+  if (value.startsWith("ecdsa")) return "ecdsa";
+  if (value.startsWith("rsa")) return "rsa";
+  return value;
 }
 
 /**
- * Verify a signed-section element (or HTML fragment).
+ * Decide whether the algorithm advertised by the resolved key can be used for
+ * the algorithm declared on the signed section (spec §11 step 5).
  *
- * Steps (spec §2.1, §3.1):
- *   1. Parse signed-section attributes and inner <meta> claim metadata.
- *   2. Apply extractCanonicalText to the innerHTML and SHA-256 hash it,
- *      prefixed as "sha256:<unpadded-base64>" per spec §2.1. Compare against the embedded
- *      content-hash attribute.
- *   3. Canonicalize claims (canonicalizeClaims) and hash them.
- *   4. Resolve keyid through the supplied resolver chain.
- *   5. Build the canonical signature binding and verify the signature.
- *
- * Failure paths populate `reason` so callers can surface the specific
- * failure mode (UI affordance, telemetry, debugging).
+ * Exact matches always pass. A generic family spelling on either side matches
+ * any identifier in that family, because it carries no parameter set to
+ * conflict with. RSA key material is padding-agnostic, so PKCS#1 v1.5 and PSS
+ * are interchangeable for the same key. Two different pinned ECDSA curves are
+ * a mismatch.
  */
+function algorithmsCompatible(resolved: string, declared: string): boolean {
+  if (resolved === declared) return true;
+  const resolvedFamily = algorithmFamily(resolved);
+  const declaredFamily = algorithmFamily(declared);
+  if (resolvedFamily !== declaredFamily) return false;
+  if (GENERIC_ALGORITHMS.has(resolved) || GENERIC_ALGORITHMS.has(declared)) return true;
+  return resolvedFamily === "rsa";
+}
+
 export async function verifySignedSection(
   section: Element | string,
   options: VerifyOptions,
 ): Promise<VerifyResult> {
   const parsed = parseSection(section);
-  const domain = defaultDomain(options.domain);
+  const origin = resolvedOrigin(options);
+  const baseUrl = options.baseUrl ?? origin;
+  const inputState = inferInputState(section, parsed, options);
   const hashFn = options.hash ?? defaultHash;
 
-  const empty = (reason: string, partial?: Partial<VerifyResult>): VerifyResult => ({
+  const empty = (
+    reason: VerificationFailureReason,
+    partial?: Partial<VerifyResult>,
+  ): VerifyResult => ({
     valid: false,
     keyid: parsed?.keyid ?? "",
     algorithm: parsed?.algorithm ?? "",
@@ -243,100 +381,138 @@ export async function verifySignedSection(
     claimsHash: "",
     claims: parsed?.claims ?? {},
     signedAt: parsed?.signedAt ?? "",
-    domain,
+    domain: origin,
+    origin,
+    inputState,
     reason,
     ...partial,
   });
 
   const debug = options.debug === true;
-  const warn = (reason: string, details: Record<string, unknown>) => {
+  const warn = (reason: VerificationFailureReason, details: Record<string, unknown>) => {
     if (debug) console.warn("[htmltrust] verify failed:", reason, details);
   };
 
   if (!parsed) {
-    warn("missing required attributes", { input: typeof section === "string" ? section.slice(0, 200) : "(Element)" });
-    return empty("missing required attributes");
+    warn("incomplete", { input: typeof section === "string" ? section.slice(0, 200) : "(Element)" });
+    return empty("incomplete");
   }
 
-  const { signature, keyid, contentHashAttr, algorithm, signedAt, claims, innerHTML } = parsed;
-  if (!signature || !keyid || !contentHashAttr || !signedAt) {
-    warn("missing required attributes", { signature: !!signature, keyid, contentHashAttr, signedAt });
-    return empty("missing required attributes");
+  const { signature, keyid, contentHashAttr, algorithm, signedAt, claims, claimEntries, innerHTML } = parsed;
+  if (!signature || !keyid || !contentHashAttr || !algorithm) {
+    warn("incomplete", { signature: !!signature, keyid, contentHashAttr, algorithm });
+    return empty("incomplete");
+  }
+  if (!SUPPORTED_ALGORITHMS.has(algorithm)) {
+    warn("algorithm-not-supported", { algorithm });
+    return empty("algorithm-not-supported");
+  }
+  if (parsed.parseFailure) {
+    warn(parsed.parseFailure, { claims });
+    return empty(parsed.parseFailure);
+  }
+  if (!signedAt) {
+    warn("claim-missing", { claim: "signed-at" });
+    return empty("claim-missing");
+  }
+  if (!parseHash(contentHashAttr)) {
+    warn("content-hash-mismatch", { contentHashAttr });
+    return empty("content-hash-mismatch");
+  }
+  if (!isCanonicalBase64(signature)) {
+    warn("signature-malformed", { signatureLength: signature.length });
+    return empty("signature-malformed");
   }
 
-  // Step 2: content hash
-  const canonicalContent = extractCanonicalText(innerHTML);
-  const computedContentHash = `sha256:${await hashFn(canonicalContent)}`;
+  let canonicalContent: string;
+  try {
+    canonicalContent = canonicalizeSignedContent(innerHTML, baseUrl);
+  } catch {
+    warn("attribute-canonicalization-failed", { baseUrl });
+    return empty("attribute-canonicalization-failed");
+  }
+  const computedDigest = await hashFn(canonicalContent);
+  if (!isCanonicalBase64(computedDigest)) {
+    warn("content-hash-mismatch", { computedDigest });
+    return empty("content-hash-mismatch");
+  }
+  const computedContentHash = `sha256:${computedDigest}`;
   if (computedContentHash !== contentHashAttr) {
-    warn("content hash mismatch", {
+    warn("content-hash-mismatch", {
       embeddedContentHash: contentHashAttr,
       computedContentHash,
       canonicalTextLength: canonicalContent.length,
       canonicalTextHead: canonicalContent.slice(0, 200),
-      canonicalTextTail: canonicalContent.slice(-200),
-      innerHTMLLength: innerHTML.length,
-      innerHTMLHead: innerHTML.slice(0, 200),
     });
-    return empty("content hash mismatch");
+    return empty("content-hash-mismatch");
   }
 
-  // Step 3: claims hash
-  const claimsCanonical = canonicalizeClaims(claims);
+  const claimsCanonical = canonicalizeClaimEntries(claimEntries);
   const claimsHash = `sha256:${await hashFn(claimsCanonical)}`;
 
-  // Step 4: keyid -> public key. Treat thrown exceptions (e.g. network
-  // errors from a resolver fetching a stale or invalid keyid URL) the same
-  // as a returned-null: "key not resolvable". Errors that bubble out of the
-  // resolver chain are not the verifier's responsibility to surface.
   let resolved = null;
   let resolverError: unknown = null;
   try {
     resolved = await resolveKey(keyid, options.keyResolvers);
   } catch (e) {
     resolverError = e;
-    resolved = null;
   }
   if (!resolved) {
-    warn("key not resolvable", { keyid, resolverError: resolverError instanceof Error ? resolverError.message : resolverError });
-    return empty("key not resolvable", { claimsHash });
+    warn("key-resolution-failed", {
+      keyid,
+      resolverError: resolverError instanceof Error ? resolverError.message : resolverError,
+    });
+    return empty("key-resolution-failed", { claimsHash });
   }
 
-  // Step 5: signature binding + verify
-  const binding = buildSignatureBinding({
-    contentHash: contentHashAttr,
-    claimsHash,
-    domain,
-    signedAt,
-  });
+  // Spec §8.2: a revoked key, or one whose `expires` has passed, is a
+  // "key-revoked" failure and MUST NOT reach signature verification. This is
+  // checked before the algorithm comparison so a revoked key cannot be
+  // reported as some milder failure.
+  if (isKeyRevoked(resolved)) {
+    warn("key-revoked", { keyid, revoked: resolved.revoked, expires: resolved.expires });
+    return empty("key-revoked", { claimsHash });
+  }
+
+  const resolvedAlgorithm = (resolved.algorithm || algorithm).toLowerCase();
+  if (!algorithmsCompatible(resolvedAlgorithm, algorithm)) {
+    warn("algorithm-mismatch", { resolvedAlgorithm, algorithm });
+    return empty("algorithm-mismatch", { claimsHash, algorithm: resolvedAlgorithm });
+  }
+
+  const binding = `${contentHashAttr}:${claimsHash}:${origin}:${signedAt}`;
+  // Pass the declared identifier through verbatim so the verifier pins the
+  // curve and hash the section committed to, rather than a coerced default.
   const sigOk = await verifySignature(
     binding,
     signature,
     resolved.publicKeyPem,
-    resolved.algorithm || algorithm,
+    algorithm,
   );
-
   if (!sigOk) {
-    warn("signature invalid", {
+    warn("signature-invalid", {
       binding,
       signature,
       keyid,
-      algorithm: resolved.algorithm || algorithm,
+      algorithm,
       publicKeyPemHead: resolved.publicKeyPem.slice(0, 80),
     });
-    return empty("signature invalid", {
+    return empty("signature-invalid", {
       claimsHash,
-      algorithm: resolved.algorithm || algorithm,
+      algorithm,
     });
   }
 
   return {
     valid: true,
     keyid,
-    algorithm: resolved.algorithm || algorithm,
+    algorithm,
     contentHash: contentHashAttr,
     claimsHash,
     claims,
     signedAt,
-    domain,
+    domain: origin,
+    origin,
+    inputState,
   };
 }
