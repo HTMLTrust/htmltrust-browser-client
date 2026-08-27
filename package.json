@@ -23,10 +23,10 @@
     "test": "node --test test/*.test.js"
   },
   "peerDependencies": {
-    "@htmltrust/canonicalization": "^0.2.1"
+    "@htmltrust/canonicalization": "^0.2.2"
   },
   "dependencies": {
-    "@htmltrust/canonicalization": "file:../htmltrust-canonicalization/javascript"
+    "@htmltrust/canonicalization": "https://github.com/HTMLTrust/htmltrust-canonicalization/archive/refs/tags/v0.2.2.tar.gz"
   },
   "devDependencies": {
     "typescript": "^5.5.0"
