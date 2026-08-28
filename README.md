@@ -19,6 +19,14 @@ npm run build
 
 The build writes JavaScript, declarations, and source maps to `dist/`. The package downloads the pinned v0.2.2 canonicalization source from its public release archive, so this repository can be cloned and installed by itself.
 
+To install the package directly from Git in another project:
+
+```sh
+npm install https://github.com/HTMLTrust/htmltrust-browser-client.git
+```
+
+The `prepare` script builds `dist/` during Git installation, so consumers do not need a generated directory committed to the repository.
+
 ## Status
 
 Reference TypeScript implementation for browser-client verification and policy evaluation. The API is still draft-aligned and may change with the HTMLTrust specifications.

@@ -19,6 +19,7 @@
   "scripts": {
     "build": "tsc",
     "typecheck": "tsc --noEmit",
+    "prepare": "npm run build",
     "pretest": "npm run build",
     "test": "node --test test/*.test.js"
   },
@@ -39,5 +40,16 @@
     "browser"
   ],
   "author": "Jason Grey <jason@jason-grey.com>",
-  "license": "LicenseRef-PolyForm-Noncommercial-1.0.0"
+  "license": "LicenseRef-PolyForm-Noncommercial-1.0.0",
+  "directories": {
+    "test": "test"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/HTMLTrust/htmltrust-browser-client.git"
+  },
+  "bugs": {
+    "url": "https://github.com/HTMLTrust/htmltrust-browser-client/issues"
+  },
+  "homepage": "https://github.com/HTMLTrust/htmltrust-browser-client#readme"
 }
