@@ -24,7 +24,7 @@ npm run typecheck
 npm run build
 ```
 
-The build writes JavaScript, declarations, and source maps to `dist/`. The package downloads canonicalization v0.3.0 from the immutable `5e51040dcaaf50935e245702bdefbc18a1d542ce` revision, so this repository installs without a sibling checkout.
+The build writes JavaScript, declarations, and source maps to `dist/`. The package downloads canonicalization v0.3.0 from the immutable `760593d4a02e9fffa56dc4d002eb52ab2ade1b49` revision, so this repository installs without a sibling checkout.
 
 When developing the client alongside the browser extension or E2E harness, use
 the sibling layout below. The extension uses a pinned Git dependency, while the
