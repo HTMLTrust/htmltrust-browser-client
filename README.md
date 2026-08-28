@@ -24,7 +24,7 @@ npm run typecheck
 npm run build
 ```
 
-The build writes JavaScript, declarations, and source maps to `dist/`. The package downloads canonicalization v0.3.0 from the immutable `b0c8f305` revision, so this repository installs without a sibling checkout.
+The build writes JavaScript, declarations, and source maps to `dist/`. The package downloads canonicalization v0.3.0 from the immutable `5e51040dcaaf50935e245702bdefbc18a1d542ce` revision, so this repository installs without a sibling checkout.
 
 To install the package directly from Git in another project:
 
