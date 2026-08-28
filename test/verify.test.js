@@ -186,6 +186,39 @@ test("verifySignedSection: detects source snapshot stale against rendered sectio
   }
 });
 
+test("verifySignedSection: compares rendered relative URLs against the live base URL", async () => {
+  const { privateKey, pem } = generateKey();
+  const { server, base } = await startServer({
+    "/key.json": () => ({ body: { publicKey: pem, algorithm: "ed25519" } }),
+  });
+  try {
+    const keyid = `${base}/key.json`;
+    const domain = "https://example.org";
+    const body = '<p><a href="signed">Signed link</a></p>';
+    const { html } = await buildSigned({
+      pem,
+      privateKey,
+      body,
+      claims: { author: "Alice" },
+      signedAt: "2026-04-28T12:00:00Z",
+      domain,
+      keyid,
+    });
+    const result = await verifySignedSection(html, {
+      keyResolvers: [directUrlResolver({ allowInsecureHttpForTesting: true })],
+      domain,
+      baseUrl: `${domain}/article`,
+      renderedBaseUrl: `${domain}/other/`,
+      renderedSection: html,
+      hash: sha256HexAsync,
+    });
+    assert.equal(result.valid, true, result.reason);
+    assert.equal(result.inputState, "stale");
+  } finally {
+    await stopServer(server);
+  }
+});
+
 // Spec §8.2: `revoked: true` or an `expires` in the past is a key-revoked
 // failure, and the verifier must not reach signature verification. Each case
 // below signs a section that is otherwise perfectly valid, so only the key

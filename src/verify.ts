@@ -43,8 +43,10 @@ export interface VerifyOptions {
   origin?: string;
   /** Base URL used to canonicalize signed href/src attribute values. */
   baseUrl?: string;
+  /** Base URL of the current rendered document when comparing a source. */
+  renderedBaseUrl?: string;
   /**
-   * Optional rendered/live section to compare with a source snapshot string.
+   * Optional rendered/live section to compare with a source snapshot.
    * When supplied, `inputState` is "rendered-match" or "stale".
    */
   renderedSection?: Element | string;
@@ -80,6 +82,8 @@ export interface VerifyResult {
 }
 
 type ParsedSection = {
+  profile: string;
+  signatureScope: string;
   signature: string;
   keyid: string;
   contentHashAttr: string;
@@ -93,8 +97,6 @@ type ParsedSection = {
 
 const SIGNED_SECTION_RE =
   /<signed-section\b([^>]*)>([\s\S]*?)<\/signed-section\s*>/i;
-const SIGNED_SECTION_RE_GLOBAL =
-  /<signed-section\b([^>]*)>([\s\S]*?)<\/signed-section\s*>/gi;
 const ATTR_RE = /([a-z_:][a-z0-9_:.-]*)\s*=\s*"([^"]*)"|([a-z_:][a-z0-9_:.-]*)\s*=\s*'([^']*)'/gi;
 const TAG_RE = /<\/?([a-z][a-z0-9-]*)\b([^>]*)>/gi;
 const VOID_ELEMENTS = new Set([
@@ -131,6 +133,87 @@ const SUPPORTED_ALGORITHMS = new Set([
 // so they are compatible with any registry identifier in the same family.
 const GENERIC_ALGORITHMS = new Set(["ecdsa", "rsa"]);
 
+/** Parse source HTML with the browser's HTML parser when available. */
+export function parseSignedSectionElements(html: string): Element[] {
+  if (typeof html !== "string") throw new TypeError("parseSignedSectionElements expects a string");
+  const Parser = (globalThis as { DOMParser?: typeof DOMParser }).DOMParser;
+  if (!Parser) throw new Error("parser-profile-unsupported");
+  const document = new Parser().parseFromString(html, "text/html");
+  return Array.from(document.querySelectorAll("signed-section"));
+}
+
+function tagEnd(source: string, start: number): number {
+  let quote = "";
+  for (let i = start + 1; i < source.length; i++) {
+    const char = source[i];
+    if (quote) {
+      if (char === quote) quote = "";
+    } else if (char === "\"" || char === "'") {
+      quote = char;
+    } else if (char === ">") {
+      return i + 1;
+    }
+  }
+  return -1;
+}
+
+/**
+ * Extract balanced signed-section source slices for non-DOM environments.
+ * This is deliberately a strict lexical fallback for the Node-compatible
+ * helper; browser verification uses parseSignedSectionElements instead.
+ */
+function extractBalancedSignedSections(html: string): string[] {
+  const found: Array<{ start: number; end: number }> = [];
+  const openSections: number[] = [];
+  let scan = 0;
+  let rawName: string | null = null;
+  while (scan < html.length) {
+    const tagStart = html.indexOf("<", scan);
+    if (tagStart < 0) break;
+    if (rawName) {
+      const close = new RegExp(`^<\\/\\s*${rawName}\\b`, "i").test(html.slice(tagStart));
+      if (!close) {
+        scan = tagStart + 1;
+        continue;
+      }
+    }
+    if (html.startsWith("<!--", tagStart)) {
+      const commentEnd = html.indexOf("-->", tagStart + 4);
+      if (commentEnd < 0) break;
+      scan = commentEnd + 3;
+      continue;
+    }
+    const end = tagEnd(html, tagStart);
+    if (end < 0) break;
+    const token = html.slice(tagStart, end);
+    if (/^<!--/.test(token) || /^<!/.test(token)) {
+      scan = end;
+      continue;
+    }
+    const nameMatch = /^<\/\s*([a-z][a-z0-9-]*)|^<\s*([a-z][a-z0-9-]*)/i.exec(token);
+    if (!nameMatch) {
+      scan = end;
+      continue;
+    }
+    const name = (nameMatch[1] ?? nameMatch[2]).toLowerCase();
+    const closing = /^<\//.test(token);
+    if (rawName) {
+      rawName = null;
+    } else if (closing && name === "signed-section") {
+      const start = openSections.pop();
+      if (start !== undefined) found.push({ start, end });
+    } else if (!closing && name === "signed-section" && !/\/\s*>$/.test(token)) {
+      openSections.push(tagStart);
+    } else if (!closing && ["script", "style", "textarea", "title", "iframe"].includes(name) && !/\/\s*>$/.test(token)) {
+      rawName = name;
+    }
+    scan = end;
+  }
+  return found
+    .sort((a, b) => a.start - b.start)
+    .map(({ start, end }) => html.slice(start, end));
+}
+
 async function defaultHash(canonical: string): Promise<string> {
   const subtle = (globalThis as { crypto?: { subtle?: SubtleCrypto } }).crypto?.subtle;
   if (!subtle) {
@@ -146,11 +229,9 @@ export function extractSignedSections(html: string): string[] {
   if (typeof html !== "string") {
     throw new TypeError("extractSignedSections expects a string");
   }
-  const out: string[] = [];
-  SIGNED_SECTION_RE_GLOBAL.lastIndex = 0;
-  let m: RegExpExecArray | null;
-  while ((m = SIGNED_SECTION_RE_GLOBAL.exec(html))) out.push(m[0]);
-  return out;
+  const Parser = (globalThis as { DOMParser?: typeof DOMParser }).DOMParser;
+  if (Parser) return parseSignedSectionElements(html).map((section) => section.outerHTML);
+  return extractBalancedSignedSections(html);
 }
 
 function parseAttrs(attrSrc: string): Record<string, string> {
@@ -203,9 +284,9 @@ function normalizeClaimEntries(rawEntries: Array<Record<string, string | undefin
   return { entries };
 }
 
-function parseSection(input: Element | string): ParsedSection | null {
-  if (typeof input === "string") return parseSectionFromString(input);
-
+function parseSectionElement(input: Element): ParsedSection {
+  const profile = input.getAttribute("profile") ?? "";
+  const signatureScope = input.getAttribute("signature-scope") ?? "";
   const signature = input.getAttribute("signature") ?? "";
   const keyid = input.getAttribute("keyid") ?? "";
   const contentHashAttr = input.getAttribute("content-hash") ?? "";
@@ -220,6 +301,8 @@ function parseSection(input: Element | string): ParsedSection | null {
   const signedAt = normalized.entries.find((entry) => entry.name === "signed-at")?.content ?? "";
 
   return {
+    profile,
+    signatureScope,
     signature,
     keyid,
     contentHashAttr,
@@ -232,14 +315,44 @@ function parseSection(input: Element | string): ParsedSection | null {
   };
 }
 
+function parseSection(input: Element | string): ParsedSection | null {
+  if (typeof input !== "string") return parseSectionElement(input);
+  // Browser callers get HTML5 tree construction for section boundaries and
+  // direct-child claims. Node callers retain the strict balanced fallback so
+  // this package remains usable without a DOM implementation.
+  const Parser = (globalThis as { DOMParser?: typeof DOMParser }).DOMParser;
+  if (Parser) {
+    const elements = parseSignedSectionElements(input);
+    if (elements[0]) return parseSectionElement(elements[0]);
+  }
+  return parseSectionFromString(input);
+}
+
 function parseSectionFromString(html: string): ParsedSection | null {
-  const m = SIGNED_SECTION_RE.exec(html);
-  if (!m) return null;
-  const attrs = parseAttrs(m[1]);
-  const inner = m[2];
+  const source = extractBalancedSignedSections(html)[0];
+  if (!source) {
+    const m = SIGNED_SECTION_RE.exec(html);
+    if (!m) return null;
+    return parseSectionParts(m[1], m[2]);
+  }
+  const openEnd = tagEnd(source, 0);
+  const closeStart = source.toLowerCase().lastIndexOf("</signed-section");
+  if (openEnd < 0 || closeStart < openEnd) return null;
+  const attrs = parseAttrs(source.slice("<signed-section".length, openEnd - 1));
+  const inner = source.slice(openEnd, closeStart);
+  return parseSectionParts(attrs, inner);
+}
+
+function parseSectionParts(
+  attrsOrSource: Record<string, string> | string,
+  inner: string,
+): ParsedSection {
+  const attrs = typeof attrsOrSource === "string" ? parseAttrs(attrsOrSource) : attrsOrSource;
   const normalized = normalizeClaimEntries(directMetaAttrsFromString(inner));
   const signedAt = normalized.entries.find((entry) => entry.name === "signed-at")?.content ?? "";
   return {
+    profile: attrs.profile ?? "",
+    signatureScope: attrs["signature-scope"] ?? "",
     signature: attrs.signature ?? "",
     keyid: attrs.keyid ?? "",
     contentHashAttr: attrs["content-hash"] ?? "",
@@ -300,8 +413,15 @@ export function canonicalizeSignedContent(innerHTML: string, baseUrl?: string): 
   return extractCanonicalText(innerHTML, { baseUrl } as Parameters<typeof extractCanonicalText>[1] & { baseUrl?: string });
 }
 
-function snapshotMatches(source: ParsedSection, rendered: ParsedSection, baseUrl: string | undefined): boolean {
+function snapshotMatches(
+  source: ParsedSection,
+  rendered: ParsedSection,
+  sourceBaseUrl: string | undefined,
+  renderedBaseUrl: string | undefined,
+): boolean {
   if (
+    source.profile !== rendered.profile ||
+    source.signatureScope !== rendered.signatureScope ||
     source.signature !== rendered.signature ||
     source.keyid !== rendered.keyid ||
     source.contentHashAttr !== rendered.contentHashAttr ||
@@ -314,8 +434,8 @@ function snapshotMatches(source: ParsedSection, rendered: ParsedSection, baseUrl
   if (canonicalizeClaimEntries(source.claimEntries) !== canonicalizeClaimEntries(rendered.claimEntries)) return false;
   try {
     return (
-      canonicalizeSignedContent(source.innerHTML, baseUrl) ===
-      canonicalizeSignedContent(rendered.innerHTML, baseUrl)
+      canonicalizeSignedContent(source.innerHTML, sourceBaseUrl) ===
+      canonicalizeSignedContent(rendered.innerHTML, renderedBaseUrl)
     );
   } catch {
     return false;
@@ -327,10 +447,16 @@ function inferInputState(
   parsed: ParsedSection | null,
   options: VerifyOptions,
 ): VerificationInputState {
-  if (typeof section !== "string") return "rendered-match";
-  if (!options.renderedSection || !parsed) return "source-only";
+  if (!options.renderedSection || !parsed) {
+    return typeof section === "string" ? "source-only" : "rendered-match";
+  }
   const rendered = parseSection(options.renderedSection);
-  return rendered && snapshotMatches(parsed, rendered, options.baseUrl ?? options.origin ?? options.domain)
+  return rendered && snapshotMatches(
+    parsed,
+    rendered,
+    options.baseUrl ?? options.origin ?? options.domain,
+    options.renderedBaseUrl ?? options.baseUrl ?? options.origin ?? options.domain,
+  )
     ? "rendered-match"
     : "stale";
 }
