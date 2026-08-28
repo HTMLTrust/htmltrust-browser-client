@@ -9,17 +9,26 @@ export const SIGNED_SEMANTIC_ATTRIBUTES = [
 
 export type VerificationFailureReason =
   | "incomplete"
+  | "profile-unsupported"
+  | "scope-unsupported"
   | "content-hash-mismatch"
   | "claim-malformed"
   | "claim-duplicate"
   | "claim-missing"
+  | "timestamp-invalid"
   | "attribute-canonicalization-failed"
+  | "parser-profile-unsupported"
+  | "url-policy-violation"
+  | "invalid-encoding"
+  | "malformed-signature"
   | "key-resolution-failed"
   | "key-revoked"
   | "algorithm-mismatch"
   | "algorithm-not-supported"
-  | "signature-malformed"
   | "signature-invalid"
+  | "malformed-key-document"
+  | "origin-not-supported"
+  | "resource-limit-exceeded"
   | "directory-unavailable"
   | "source-refetch-failed"
   | "network-policy-blocked";
@@ -56,11 +65,17 @@ export function isCanonicalBase64(value: string): boolean {
 export function parseHash(value: string): { algorithm: string; digest: string } | null {
   const i = value.indexOf(":");
   if (i <= 0) return null;
-  const algorithm = value.slice(0, i).toLowerCase();
+  const algorithm = value.slice(0, i);
   const digest = value.slice(i + 1);
-  if (algorithm !== "sha256") return null;
+  const outputLengths: Record<string, number> = {
+    sha256: 32,
+    sha384: 48,
+    sha512: 64,
+  };
+  const outputLength = outputLengths[algorithm];
+  if (!outputLength) return null;
   const bytes = decodeCanonicalBase64(digest);
-  if (!bytes || bytes.byteLength !== 32) return null;
+  if (!bytes || bytes.byteLength !== outputLength) return null;
   return { algorithm, digest };
 }
 

@@ -73,7 +73,7 @@ test("extractSignedSections: returned strings round-trip through verifySignedSec
   // verifySignedSection(html, options).
   const { verifySignedSection } = await import("../dist/index.js");
   const html = `<html>
-    <signed-section keyid="did:web:x" content-hash="sha256:x" signature="x" algorithm="ed25519">
+    <signed-section profile="htmltrust-signature-v1" signature-scope="url" keyid="did:web:x" content-hash="sha256:x" signature="x" algorithm="ed25519">
       <meta name="signed-at" content="2026-01-01T00:00:00Z">
       <meta name="claim:license" content="CC-BY-4.0">
       <p>body</p>
@@ -84,5 +84,5 @@ test("extractSignedSections: returned strings round-trip through verifySignedSec
   // the slice parsed far enough to reach canonical verification.
   const result = await verifySignedSection(slice, { domain: "https://x.example", keyResolvers: [] });
   assert.equal(result.valid, false);
-  assert.equal(result.reason, "content-hash-mismatch");
+  assert.equal(result.reason, "invalid-encoding");
 });

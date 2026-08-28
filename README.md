@@ -1,6 +1,13 @@
 # HTMLTrust Browser Client
 
-Reference implementation of the HTMLTrust client-side verification and trust policy evaluation, as a language-neutral TypeScript library that can be used in browsers, Node.js crawlers, test harnesses, and any other verifying client.
+- Maintainer: Jason Grey
+- Updated: 2026-08-28
+- Version: 0.1.2, draft v1 profile
+- Status: Reference implementation
+- For: browser, crawler, and integration developers
+- Reading time: 5 minutes
+
+This TypeScript package verifies HTMLTrust v1 signed sections and evaluates local trust policy. It runs in browsers and Node.js.
 
 ## Quick start
 
@@ -17,7 +24,7 @@ npm run typecheck
 npm run build
 ```
 
-The build writes JavaScript, declarations, and source maps to `dist/`. The package downloads the pinned v0.2.2 canonicalization source from its public release archive, so this repository can be cloned and installed by itself.
+The build writes JavaScript, declarations, and source maps to `dist/`. The package downloads canonicalization v0.3.0 from the immutable `b0c8f305` revision, so this repository installs without a sibling checkout.
 
 To install the package directly from Git in another project:
 
@@ -49,19 +56,34 @@ Two layers, matching the specification's two-layer verification model:
 ### Layer 1: Cryptographic verification (local, deterministic)
 
 ```typescript
-import { verifySignedSection, defaultResolverChain } from "@htmltrust/browser-client";
+import {
+  defaultResolverChain,
+  extractSignedSections,
+  verifySignedSection,
+} from "@htmltrust/browser-client";
 
-// Given a <signed-section> DOM element (or a parsed HTML fragment):
-const result = await verifySignedSection(element, {
-  // Resolver chain; defaults try did:web, then direct URL, then configured directories
+// Keep this exact slice from the HTTP response body. A DOM Element has already
+// lost duplicate attributes and other source-level parser evidence.
+const response = await fetch("https://example.org/article");
+const [rawSignedSection] = extractSignedSections(await response.text());
+const documentUrl = response.url;
+const liveSignedSection = document.querySelector("signed-section");
+
+const result = await verifySignedSection(rawSignedSection, {
   keyResolvers: defaultResolverChain(),
-  // Serialized Web origin, equivalent to window.location.origin.
-  origin: "https://example.org",
+  origin: new URL(documentUrl).origin,
+  documentUrl,
+  baseUrl: documentUrl,
+  // Optional: compare the signed response source with the current DOM.
+  renderedSection: liveSignedSection,
+  renderedBaseUrl: window.location.href,
 });
 
 // result: { valid: true, keyid, algorithm, contentHash, claims, signedAt, origin, domain, inputState }
 // or:     { valid: false, reason: "content-hash-mismatch" | "signature-invalid" | "key-resolution-failed" | ... }
 ```
+
+Pass the original source string for full v1 checks. An `Element` input remains available for callers that only have a DOM, but it cannot recover source ambiguities that the browser parser repaired.
 
 ### Layer 2: Trust decision (client policy)
 
@@ -114,7 +136,7 @@ const detailed = await fetchEndorsementsWithFailures(contentHash, {
 - Web standard `crypto.subtle` (SubtleCrypto) in browsers
 - Node `node:crypto.webcrypto` in Node.js
 - `@htmltrust/canonicalization` for text normalization and HTML text extraction
-- No other runtime dependencies are required.
+- `parse5` for browser-equivalent source parsing in Node.js
 
 ## Tests
 
@@ -132,9 +154,9 @@ This project is licensed under the [PolyForm Noncommercial License 1.0.0](https:
 
 ## Origin & Contributions
 
-HTMLTrust is an idea I (Jason Grey) have been chewing on since 2024. I'm not an academic — I'm an engineer with a day job and a family — so the spec, the reference implementations, and most of this prose have been written with significant help from AI tools acting as research assistant, technical writer, and pair programmer. I wrote the original architectural sketches and reviewed every line; the assistants filled in the gaps and saved me from re-typing the same explanation for the hundredth time.
+HTMLTrust is an idea I (Jason Grey) have been working on since 2024. I am an engineer with a day job and a family. AI tools have helped as research assistants, technical writers, and pair programmers. I wrote the original architectural sketches and reviewed every line.
 
-**Contributions are welcome — human or AI-assisted, doesn't matter to me.** What matters is whether the code, the spec text, or the conformance vectors move the project forward. Open a PR.
+Contributions may be human-written or AI-assisted. Open a pull request with tests or conformance evidence for the change.
 
 What this project is **not** a forum for:
 
@@ -142,6 +164,6 @@ What this project is **not** a forum for:
 - Opinions on who is or isn't trustworthy on the web.
 - Politics, religion, professional practice, or personal philosophy.
 
-HTMLTrust is a mechanism — a way for *anyone* to sign content they publish and for *anyone* to decide whom they trust, on their own terms. The project takes no position on what the right answers are; it just provides the tools. If you want to debate the answers, there are entire continents of the internet better suited to it.
+HTMLTrust lets publishers sign content and lets readers choose which keys they trust. The project does not define who deserves trust.
 
 If this work is useful to you and you'd like to support it, see [GitHub Sponsors](https://github.com/sponsors/jt55401) or the other channels in [`.github/FUNDING.yml`](.github/FUNDING.yml).

@@ -7,16 +7,20 @@
  */
 
 import {
+  buildSigningPayloadV1,
+  canonicalizeClaims,
+  decodeCanonicalBase64,
   extractCanonicalText,
+  extractClaimsFromSignedSection,
   isKeyRevoked,
   resolveKey,
+  validateSignedAtV1,
   verifySignature,
 } from "@htmltrust/canonicalization";
 import type { KeyResolver } from "@htmltrust/canonicalization";
+import * as parse5 from "parse5";
 import {
-  SIGNED_SEMANTIC_ATTRIBUTES,
   bytesToUnpaddedBase64,
-  canonicalizeClaimEntries,
   claimsToRecord,
   currentSerializedOrigin,
   isCanonicalBase64,
@@ -45,6 +49,8 @@ export interface VerifyOptions {
   baseUrl?: string;
   /** Base URL of the current rendered document when comparing a source. */
   renderedBaseUrl?: string;
+  /** Final response URL of the signed document, used for the v1 location. */
+  documentUrl?: string;
   /**
    * Optional rendered/live section to compare with a source snapshot.
    * When supplied, `inputState` is "rendered-match" or "stale".
@@ -92,6 +98,8 @@ type ParsedSection = {
   claims: Record<string, string>;
   claimEntries: ClaimEntry[];
   innerHTML: string;
+  /** Complete source slice, retained so the canonicalizer can preflight the opening tag. */
+  sourceHTML: string;
   parseFailure?: VerificationFailureReason;
 };
 
@@ -116,22 +124,15 @@ const VOID_ELEMENTS = new Set([
   "wbr",
 ]);
 const EXCLUDED_ELEMENTS = new Set(["script", "style", "template", "noscript", "iframe", "meta"]);
-// Spec §7.1 signature algorithm registry, plus the two legacy generic
-// spellings ("ecdsa", "rsa") earlier releases of this library emitted. An
-// algorithm outside this set is an "algorithm-not-supported" failure, never a
-// generic one (spec §7.1).
+// Spec §7.1 signature algorithm registry. Legacy generic spellings are not
+// part of the frozen v1 profile and must not be accepted as a fallback.
 const SUPPORTED_ALGORITHMS = new Set([
   "ed25519",
-  "ecdsa",
   "ecdsa-p256",
   "ecdsa-p384",
-  "rsa",
   "rsa-pss-sha256",
   "rsa-pkcs1-sha256",
 ]);
-// The generic spellings name a family and leave the parameter set to the key,
-// so they are compatible with any registry identifier in the same family.
-const GENERIC_ALGORITHMS = new Set(["ecdsa", "rsa"]);
 
 /** Parse source HTML with the browser's HTML parser when available. */
 export function parseSignedSectionElements(html: string): Element[] {
@@ -229,8 +230,8 @@ export function extractSignedSections(html: string): string[] {
   if (typeof html !== "string") {
     throw new TypeError("extractSignedSections expects a string");
   }
-  const Parser = (globalThis as { DOMParser?: typeof DOMParser }).DOMParser;
-  if (Parser) return parseSignedSectionElements(html).map((section) => section.outerHTML);
+  // Preserve the exact source slice. DOM outerHTML is a serialization of the
+  // repaired tree and discards diagnostics such as duplicate attributes.
   return extractBalancedSignedSections(html);
 }
 
@@ -274,8 +275,8 @@ function normalizeClaimEntries(rawEntries: Array<Record<string, string | undefin
   const seen = new Set<string>();
   for (const raw of rawEntries) {
     if (raw.name === undefined || raw.content === undefined) return { entries, failure: "claim-malformed" };
-    const name = normalizeClaimText(raw.name);
-    const content = normalizeClaimText(raw.content);
+    const name = normalizeClaimText(raw.name).trim();
+    const content = normalizeClaimText(raw.content).trim();
     if (!name) return { entries, failure: "claim-malformed" };
     if (seen.has(name)) return { entries, failure: "claim-duplicate" };
     seen.add(name);
@@ -290,7 +291,7 @@ function parseSectionElement(input: Element): ParsedSection {
   const signature = input.getAttribute("signature") ?? "";
   const keyid = input.getAttribute("keyid") ?? "";
   const contentHashAttr = input.getAttribute("content-hash") ?? "";
-  const algorithm = (input.getAttribute("algorithm") ?? "").toLowerCase();
+  const algorithm = input.getAttribute("algorithm") ?? "";
   const rawMetas = Array.from(input.children)
     .filter((child) => child.localName.toLowerCase() === "meta")
     .map((meta) => ({
@@ -311,21 +312,24 @@ function parseSectionElement(input: Element): ParsedSection {
     claimEntries: normalized.entries,
     claims: claimsToRecord(normalized.entries),
     innerHTML: input.innerHTML,
+    sourceHTML: input.outerHTML,
     parseFailure: normalized.failure,
   };
 }
 
 function parseSection(input: Element | string): ParsedSection | null {
   if (typeof input !== "string") return parseSectionElement(input);
-  // Browser callers get HTML5 tree construction for section boundaries and
-  // direct-child claims. Node callers retain the strict balanced fallback so
-  // this package remains usable without a DOM implementation.
+  const source = extractBalancedSignedSections(input)[0];
+  if (!source) return parseSectionFromString(input);
+  // Browser callers still use HTML5 tree construction for attribute values
+  // and direct-child mapping, while retaining the exact source slice for the
+  // portable-profile preflight.
   const Parser = (globalThis as { DOMParser?: typeof DOMParser }).DOMParser;
   if (Parser) {
-    const elements = parseSignedSectionElements(input);
-    if (elements[0]) return parseSectionElement(elements[0]);
+    const elements = parseSignedSectionElements(source);
+    if (elements[0]) return { ...parseSectionElement(elements[0]), sourceHTML: source };
   }
-  return parseSectionFromString(input);
+  return parseSectionFromString(source);
 }
 
 function parseSectionFromString(html: string): ParsedSection | null {
@@ -333,19 +337,51 @@ function parseSectionFromString(html: string): ParsedSection | null {
   if (!source) {
     const m = SIGNED_SECTION_RE.exec(html);
     if (!m) return null;
-    return parseSectionParts(m[1], m[2]);
+    return parseSectionParts(m[1], m[2], m[0]);
   }
   const openEnd = tagEnd(source, 0);
   const closeStart = source.toLowerCase().lastIndexOf("</signed-section");
   if (openEnd < 0 || closeStart < openEnd) return null;
-  const attrs = parseAttrs(source.slice("<signed-section".length, openEnd - 1));
+  // Use the same HTML tokenizer for Node and browser callers. The lexical
+  // source slice remains authoritative for preflight and canonicalization,
+  // while parse5 supplies HTML's unquoted-attribute and character-reference
+  // rules for protocol attributes.
+  const parsedAttrs = parseSectionAttributesWithParser(source);
+  const attrs = parsedAttrs ?? parseAttrs(source.slice("<signed-section".length, openEnd - 1));
   const inner = source.slice(openEnd, closeStart);
-  return parseSectionParts(attrs, inner);
+  return parseSectionParts(attrs, inner, source);
+}
+
+function parseSectionAttributesWithParser(source: string): Record<string, string> | null {
+  try {
+    const fragment = parse5.parseFragment(source) as unknown as { childNodes?: Array<Record<string, unknown>> };
+    const find = (nodes: Array<Record<string, unknown>>): Record<string, unknown> | null => {
+      for (const node of nodes) {
+        if (String(node.tagName ?? "").toLowerCase() === "signed-section") return node;
+        const children = node.childNodes;
+        if (Array.isArray(children)) {
+          const nested = find(children as Array<Record<string, unknown>>);
+          if (nested) return nested;
+        }
+      }
+      return null;
+    };
+    const section = find(fragment.childNodes ?? []);
+    if (!section) return null;
+    const attrs: Record<string, string> = {};
+    for (const attr of (section.attrs as Array<{ name?: string; value?: string }> | undefined) ?? []) {
+      if (attr.name) attrs[attr.name.toLowerCase()] = attr.value ?? "";
+    }
+    return attrs;
+  } catch {
+    return null;
+  }
 }
 
 function parseSectionParts(
   attrsOrSource: Record<string, string> | string,
   inner: string,
+  sourceHTML: string,
 ): ParsedSection {
   const attrs = typeof attrsOrSource === "string" ? parseAttrs(attrsOrSource) : attrsOrSource;
   const normalized = normalizeClaimEntries(directMetaAttrsFromString(inner));
@@ -356,61 +392,46 @@ function parseSectionParts(
     signature: attrs.signature ?? "",
     keyid: attrs.keyid ?? "",
     contentHashAttr: attrs["content-hash"] ?? "",
-    algorithm: (attrs.algorithm ?? "").toLowerCase(),
+    algorithm: attrs.algorithm ?? "",
     signedAt,
     claimEntries: normalized.entries,
     claims: claimsToRecord(normalized.entries),
     innerHTML: inner,
+    sourceHTML,
     parseFailure: normalized.failure,
   };
 }
 
-function resolvedOrigin(options: VerifyOptions): string {
+function documentUrl(options: VerifyOptions): string {
+  if (options.documentUrl) return options.documentUrl;
+  const href = (globalThis as { location?: Location }).location?.href;
+  if (href) return href;
+  // Keep the old origin option usable as a source-only fallback. New callers
+  // should always provide the final response URL explicitly.
+  return options.origin ?? options.domain ?? "";
+}
+
+function resolvedOrigin(options: VerifyOptions, url = documentUrl(options)): string {
+  try {
+    if (url) return serializeOrigin(url);
+  } catch {
+    // The verifier reports origin-not-supported after the content and claims
+    // stages, rather than throwing while constructing a failure result.
+  }
   const explicit = options.origin ?? options.domain;
-  if (explicit) return serializeOrigin(explicit);
+  try {
+    if (explicit) return serializeOrigin(explicit);
+  } catch {
+    // Keep failure results total even for malformed caller context.
+  }
   return currentSerializedOrigin();
 }
 
-function normalizeUrlAttribute(value: string, baseUrl: string | undefined): string | null {
-  try {
-    const url = new URL(value, baseUrl);
-    const serialized = url.href;
-    return serialized.includes("\n") ? null : serialized;
-  } catch {
-    return null;
-  }
-}
-
-function semanticAttributeRecords(innerHTML: string, baseUrl: string | undefined): string | null {
-  const records: string[] = [];
-  TAG_RE.lastIndex = 0;
-  let m: RegExpExecArray | null;
-  while ((m = TAG_RE.exec(innerHTML))) {
-    const raw = m[0];
-    if (raw.startsWith("</")) continue;
-    const elementName = m[1].toLowerCase();
-    if (EXCLUDED_ELEMENTS.has(elementName)) continue;
-    const attrs = parseAttrs(m[2]);
-    for (const attr of SIGNED_SEMANTIC_ATTRIBUTES) {
-      if (!(attr in attrs)) continue;
-      const value =
-        attr === "href" || attr === "src"
-          ? normalizeUrlAttribute(attrs[attr], baseUrl)
-          : normalizeClaimText(attrs[attr]);
-      if (value === null || value.includes("\n")) return null;
-      records.push(`@attr:${elementName}:${attr}:${value}\n`);
-    }
-  }
-  return records.join("");
-}
-
 export function canonicalizeSignedContent(innerHTML: string, baseUrl?: string): string {
-  const attrRecords = semanticAttributeRecords(innerHTML, baseUrl);
-  if (attrRecords === null) throw new Error("attribute-canonicalization-failed");
-  // The installed canonicalization implementation already emits the signed
-  // semantic attribute records. Passing baseUrl keeps href/src deterministic.
-  void attrRecords;
-  return extractCanonicalText(innerHTML, { baseUrl } as Parameters<typeof extractCanonicalText>[1] & { baseUrl?: string });
+  // v0.3 owns the frozen safe-URL and parser profile. In particular, it checks
+  // C0 controls before URL() can silently remove them and distinguishes policy
+  // violations from malformed URLs.
+  return extractCanonicalText(innerHTML, { baseUrl });
 }
 
 function snapshotMatches(
@@ -431,7 +452,11 @@ function snapshotMatches(
     return false;
   }
   if (source.parseFailure || rendered.parseFailure) return false;
-  if (canonicalizeClaimEntries(source.claimEntries) !== canonicalizeClaimEntries(rendered.claimEntries)) return false;
+  try {
+    if (canonicalizeClaims(source.claims) !== canonicalizeClaims(rendered.claims)) return false;
+  } catch {
+    return false;
+  }
   try {
     return (
       canonicalizeSignedContent(source.innerHTML, sourceBaseUrl) ===
@@ -454,47 +479,116 @@ function inferInputState(
   return rendered && snapshotMatches(
     parsed,
     rendered,
-    options.baseUrl ?? options.origin ?? options.domain,
-    options.renderedBaseUrl ?? options.baseUrl ?? options.origin ?? options.domain,
+    options.baseUrl ?? documentUrl(options),
+    options.renderedBaseUrl ?? options.baseUrl ?? documentUrl(options),
   )
     ? "rendered-match"
     : "stale";
 }
 
-function algorithmFamily(value: string): string {
-  if (value.startsWith("ecdsa")) return "ecdsa";
-  if (value.startsWith("rsa")) return "rsa";
-  return value;
+function protocolAttributeHasEdgeWhitespace(value: string): boolean {
+  return /^[\u0009-\u000D\u0020]|[\u0009-\u000D\u0020]$/u.test(value);
+}
+
+function canonicalizationFailure(error: unknown): VerificationFailureReason {
+  const message = error instanceof Error ? error.message : String(error);
+  if (message.startsWith("url-policy-violation")) return "url-policy-violation";
+  if (message.startsWith("parser-profile-unsupported")) return "parser-profile-unsupported";
+  if (message.startsWith("resource-limit-exceeded")) return "resource-limit-exceeded";
+  if (message.startsWith("claim-malformed")) return "claim-malformed";
+  if (message.startsWith("claim-duplicate")) return "claim-duplicate";
+  return "attribute-canonicalization-failed";
+}
+
+function resolverFailure(error: unknown): VerificationFailureReason {
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  if (message.startsWith("network-policy-blocked")) return "network-policy-blocked";
+  if (message.startsWith("resource-limit-exceeded")) return "resource-limit-exceeded";
+  if (message.startsWith("malformed-key-document")) return "malformed-key-document";
+  return "key-resolution-failed";
 }
 
 /**
- * Decide whether the algorithm advertised by the resolved key can be used for
- * the algorithm declared on the signed section (spec §11 step 5).
- *
- * Exact matches always pass. A generic family spelling on either side matches
- * any identifier in that family, because it carries no parameter set to
- * conflict with. RSA key material is padding-agnostic, so PKCS#1 v1.5 and PSS
- * are interchangeable for the same key. Two different pinned ECDSA curves are
- * a mismatch.
+ * Run the source-only portion of the canonicalization profile. The shared
+ * claims parser performs the portable source preflight and resource checks
+ * without walking signed text or resolving signed URLs. Claim-shape failures
+ * are intentionally deferred to the claims step below.
  */
-function algorithmsCompatible(resolved: string, declared: string): boolean {
-  if (resolved === declared) return true;
-  const resolvedFamily = algorithmFamily(resolved);
-  const declaredFamily = algorithmFamily(declared);
-  if (resolvedFamily !== declaredFamily) return false;
-  if (GENERIC_ALGORITHMS.has(resolved) || GENERIC_ALGORITHMS.has(declared)) return true;
-  return resolvedFamily === "rsa";
+function preflightSignedSource(sourceHTML: string): void {
+  try {
+    extractClaimsFromSignedSection(sourceHTML);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (message.startsWith("claim-malformed") || message.startsWith("claim-duplicate")) return;
+    throw error;
+  }
+}
+
+type DerValue = { contentStart: number; contentEnd: number; next: number };
+
+function readDerValue(bytes: Uint8Array, offset: number, expectedTag: number): DerValue | null {
+  if (offset + 2 > bytes.length || bytes[offset] !== expectedTag) return null;
+  const firstLength = bytes[offset + 1];
+  let length = firstLength;
+  let contentStart = offset + 2;
+  if ((firstLength & 0x80) !== 0) {
+    const octets = firstLength & 0x7f;
+    if (octets < 1 || octets > 4 || contentStart + octets > bytes.length) return null;
+    length = 0;
+    for (let i = 0; i < octets; i++) length = (length * 256) + bytes[contentStart + i];
+    contentStart += octets;
+  }
+  const contentEnd = contentStart + length;
+  if (contentEnd > bytes.length) return null;
+  return { contentStart, contentEnd, next: contentEnd };
+}
+
+/** Return the RSA modulus width from an SPKI PEM key, or null for malformed input. */
+function rsaModulusWidth(publicKeyPem: string): number | null {
+  const match = /-----BEGIN PUBLIC KEY-----([A-Za-z0-9+/=\s]+)-----END PUBLIC KEY-----/u.exec(publicKeyPem);
+  if (!match) return null;
+  let bytes: Uint8Array;
+  try {
+    const binary = atob(match[1].replace(/\s+/gu, ""));
+    bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+  } catch {
+    return null;
+  }
+  const spki = readDerValue(bytes, 0, 0x30);
+  if (!spki || spki.next !== bytes.length) return null;
+  const algorithm = readDerValue(bytes, spki.contentStart, 0x30);
+  if (!algorithm) return null;
+  const bitString = readDerValue(bytes, algorithm.next, 0x03);
+  if (!bitString || bitString.next !== spki.contentEnd || bytes[bitString.contentStart] !== 0) return null;
+  const rsaKey = readDerValue(bytes, bitString.contentStart + 1, 0x30);
+  if (!rsaKey || rsaKey.next !== bitString.contentEnd) return null;
+  const modulus = readDerValue(bytes, rsaKey.contentStart, 0x02);
+  if (!modulus || modulus.contentStart === modulus.contentEnd) return null;
+  const leadingSignByte = bytes[modulus.contentStart] === 0 ? 1 : 0;
+  const width = modulus.contentEnd - modulus.contentStart - leadingSignByte;
+  return width > 0 ? width : null;
 }
 
 export async function verifySignedSection(
+  /**
+   * Full v1 conformance requires a source string. An Element has already been
+   * parsed and serialized by the caller, so source-level ambiguity checks such
+   * (for example duplicate attributes) cannot be recovered from it.
+   */
   section: Element | string,
   options: VerifyOptions,
 ): Promise<VerifyResult> {
   const parsed = parseSection(section);
-  const origin = resolvedOrigin(options);
-  const baseUrl = options.baseUrl ?? origin;
+  const finalDocumentUrl = documentUrl(options);
+  const origin = resolvedOrigin(options, finalDocumentUrl);
+  // The HTML base URL controls relative href/src canonicalization. The final
+  // response URL controls only the v1 signed location and may differ when a
+  // document contains a <base> element or was reached through redirects.
+  const baseUrl = (options.baseUrl ?? finalDocumentUrl) || undefined;
   const inputState = inferInputState(section, parsed, options);
   const hashFn = options.hash ?? defaultHash;
+  let resultClaims = parsed?.claims ?? {};
+  let resultSignedAt = parsed?.signedAt ?? "";
 
   const empty = (
     reason: VerificationFailureReason,
@@ -505,8 +599,8 @@ export async function verifySignedSection(
     algorithm: parsed?.algorithm ?? "",
     contentHash: parsed?.contentHashAttr ?? "",
     claimsHash: "",
-    claims: parsed?.claims ?? {},
-    signedAt: parsed?.signedAt ?? "",
+    claims: resultClaims,
+    signedAt: resultSignedAt,
     domain: origin,
     origin,
     inputState,
@@ -524,38 +618,64 @@ export async function verifySignedSection(
     return empty("incomplete");
   }
 
-  const { signature, keyid, contentHashAttr, algorithm, signedAt, claims, claimEntries, innerHTML } = parsed;
-  if (!signature || !keyid || !contentHashAttr || !algorithm) {
-    warn("incomplete", { signature: !!signature, keyid, contentHashAttr, algorithm });
+  // Source preflight and resource ceilings are the only canonicalization work
+  // permitted before protocol-attribute validation. Content extraction and URL
+  // handling happen only after the exact v1 profile and encodings are selected.
+  try {
+    preflightSignedSource(parsed.sourceHTML);
+  } catch (error) {
+    const reason = canonicalizationFailure(error);
+    warn(reason, { baseUrl });
+    return empty(reason);
+  }
+
+  const { profile, signatureScope, signature, keyid, contentHashAttr, algorithm, sourceHTML } = parsed;
+  const protocolAttributes = { profile, "signature-scope": signatureScope, keyid, signature, "content-hash": contentHashAttr, algorithm };
+  if (Object.values(protocolAttributes).some((value) => !value || protocolAttributeHasEdgeWhitespace(value))) {
+    warn("incomplete", { attributes: Object.fromEntries(Object.entries(protocolAttributes).map(([name, value]) => [name, value !== ""])) });
     return empty("incomplete");
   }
-  if (!SUPPORTED_ALGORITHMS.has(algorithm)) {
-    warn("algorithm-not-supported", { algorithm });
-    return empty("algorithm-not-supported");
+  if (profile !== "htmltrust-signature-v1") {
+    warn("profile-unsupported", { profile });
+    return empty("profile-unsupported");
   }
-  if (parsed.parseFailure) {
-    warn(parsed.parseFailure, { claims });
-    return empty(parsed.parseFailure);
+  if (signatureScope !== "url" && signatureScope !== "origin") {
+    warn("scope-unsupported", { signatureScope });
+    return empty("scope-unsupported");
   }
-  if (!signedAt) {
-    warn("claim-missing", { claim: "signed-at" });
-    return empty("claim-missing");
-  }
-  if (!parseHash(contentHashAttr)) {
-    warn("content-hash-mismatch", { contentHashAttr });
-    return empty("content-hash-mismatch");
+  const parsedHash = parseHash(contentHashAttr);
+  if (!parsedHash) {
+    warn("invalid-encoding", { contentHashAttr });
+    return empty("invalid-encoding");
   }
   if (!isCanonicalBase64(signature)) {
-    warn("signature-malformed", { signatureLength: signature.length });
-    return empty("signature-malformed");
+    warn("invalid-encoding", { signatureLength: signature.length });
+    return empty("invalid-encoding");
+  }
+  if (parsedHash.algorithm !== "sha256" || !SUPPORTED_ALGORITHMS.has(algorithm)) {
+    warn("algorithm-not-supported", { hashAlgorithm: parsedHash.algorithm, algorithm });
+    return empty("algorithm-not-supported");
+  }
+  const signatureBytes = decodeCanonicalBase64(signature);
+  const expectedSignatureLength = algorithm === "ed25519"
+    ? 64
+    : algorithm === "ecdsa-p256"
+      ? 64
+      : algorithm === "ecdsa-p384"
+        ? 96
+        : null;
+  if (expectedSignatureLength !== null && signatureBytes.byteLength !== expectedSignatureLength) {
+    warn("malformed-signature", { algorithm, signatureLength: signatureBytes.byteLength });
+    return empty("malformed-signature");
   }
 
   let canonicalContent: string;
   try {
-    canonicalContent = canonicalizeSignedContent(innerHTML, baseUrl);
-  } catch {
-    warn("attribute-canonicalization-failed", { baseUrl });
-    return empty("attribute-canonicalization-failed");
+    canonicalContent = canonicalizeSignedContent(parsed.sourceHTML, baseUrl);
+  } catch (error) {
+    const reason = canonicalizationFailure(error);
+    warn(reason, { baseUrl });
+    return empty(reason);
   }
   const computedDigest = await hashFn(canonicalContent);
   if (!isCanonicalBase64(computedDigest)) {
@@ -573,8 +693,61 @@ export async function verifySignedSection(
     return empty("content-hash-mismatch");
   }
 
-  const claimsCanonical = canonicalizeClaimEntries(claimEntries);
+  let claims: Record<string, string>;
+  try {
+    claims = extractClaimsFromSignedSection(sourceHTML);
+    resultClaims = claims;
+  } catch (error) {
+    const reason = canonicalizationFailure(error);
+    warn(reason, {});
+    return empty(reason);
+  }
+  const signedAt = claims["signed-at"] ?? "";
+  resultSignedAt = signedAt;
+  if (!signedAt) {
+    warn("claim-missing", { claim: "signed-at" });
+    return empty("claim-missing");
+  }
+  try {
+    validateSignedAtV1(signedAt);
+  } catch {
+    warn("timestamp-invalid", { signedAt });
+    return empty("timestamp-invalid");
+  }
+
+  let claimsCanonical: string;
+  try {
+    claimsCanonical = canonicalizeClaims(claims);
+  } catch (error) {
+    const reason = canonicalizationFailure(error);
+    warn(reason, { claims });
+    return empty(reason);
+  }
   const claimsHash = `sha256:${await hashFn(claimsCanonical)}`;
+
+  let signingPayload: string;
+  try {
+    signingPayload = buildSigningPayloadV1({
+      contentHash: contentHashAttr,
+      claimsHash,
+      documentURL: finalDocumentUrl,
+      scope: signatureScope,
+      keyid,
+      algorithm,
+      signedAt,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const reason: VerificationFailureReason = message.startsWith("scope-unsupported")
+      ? "scope-unsupported"
+      : message.startsWith("timestamp-invalid")
+        ? "timestamp-invalid"
+        : message.startsWith("resource-limit-exceeded")
+          ? "resource-limit-exceeded"
+          : "origin-not-supported";
+    warn(reason, { documentUrl: finalDocumentUrl, signatureScope });
+    return empty(reason, { claimsHash });
+  }
 
   let resolved = null;
   let resolverError: unknown = null;
@@ -584,11 +757,12 @@ export async function verifySignedSection(
     resolverError = e;
   }
   if (!resolved) {
-    warn("key-resolution-failed", {
+    const reason = resolverFailure(resolverError);
+    warn(reason, {
       keyid,
       resolverError: resolverError instanceof Error ? resolverError.message : resolverError,
     });
-    return empty("key-resolution-failed", { claimsHash });
+    return empty(reason, { claimsHash });
   }
 
   // Spec §8.2: a revoked key, or one whose `expires` has passed, is a
@@ -600,24 +774,32 @@ export async function verifySignedSection(
     return empty("key-revoked", { claimsHash });
   }
 
-  const resolvedAlgorithm = (resolved.algorithm || algorithm).toLowerCase();
-  if (!algorithmsCompatible(resolvedAlgorithm, algorithm)) {
+  const resolvedAlgorithm = resolved.algorithm || "";
+  if (resolvedAlgorithm !== algorithm) {
     warn("algorithm-mismatch", { resolvedAlgorithm, algorithm });
     return empty("algorithm-mismatch", { claimsHash, algorithm: resolvedAlgorithm });
   }
 
-  const binding = `${contentHashAttr}:${claimsHash}:${origin}:${signedAt}`;
-  // Pass the declared identifier through verbatim so the verifier pins the
-  // curve and hash the section committed to, rather than a coerced default.
+  if (algorithm.startsWith("rsa-")) {
+    const modulusWidth = rsaModulusWidth(resolved.publicKeyPem);
+    if (modulusWidth === null) {
+      warn("malformed-key-document", { keyid });
+      return empty("malformed-key-document", { claimsHash });
+    }
+    if (signatureBytes.byteLength !== modulusWidth) {
+      warn("malformed-signature", { algorithm, signatureLength: signatureBytes.byteLength, modulusWidth });
+      return empty("malformed-signature", { claimsHash });
+    }
+  }
   const sigOk = await verifySignature(
-    binding,
+    signingPayload,
     signature,
     resolved.publicKeyPem,
     algorithm,
   );
   if (!sigOk) {
     warn("signature-invalid", {
-      binding,
+      signingPayload,
       signature,
       keyid,
       algorithm,
