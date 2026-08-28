@@ -7,7 +7,12 @@
  * Plus endorsement fetching/verification (§2.5) and resolver helpers.
  */
 
-export { verifySignedSection, extractSignedSections, canonicalizeSignedContent } from "./verify.js";
+export {
+  verifySignedSection,
+  extractSignedSections,
+  parseSignedSectionElements,
+  canonicalizeSignedContent,
+} from "./verify.js";
 export type { VerifyOptions, VerifyResult } from "./verify.js";
 
 export { evaluateTrustPolicy } from "./policy.js";

@@ -45,6 +45,14 @@ test("extractSignedSections: returns sections in document order", () => {
   assert.ok(result[2].includes('keyid="c"'));
 });
 
+test("extractSignedSections: balances nested sections and ignores tag-like text in raw elements", () => {
+  const html = '<signed-section keyid="outer"><script>\'<\/signed-section>\'</script><signed-section keyid="inner">in</signed-section>out</signed-section>';
+  const result = extractSignedSections(html);
+  assert.equal(result.length, 2);
+  assert.equal(result[0], html);
+  assert.equal(result[1], '<signed-section keyid="inner">in</signed-section>');
+});
+
 test("extractSignedSections: tolerates whitespace and case in closing tag", () => {
   const html = `<signed-section keyid="x" content-hash="sha256:x" signature="x" algorithm="ed25519"><p>x</p></SIGNED-SECTION >`;
   const result = extractSignedSections(html);
