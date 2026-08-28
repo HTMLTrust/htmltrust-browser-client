@@ -1,6 +1,6 @@
 {
   "name": "@htmltrust/browser-client",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "description": "Reference implementation of the HTMLTrust client-side verification and trust policy evaluation. Browser- and Node-compatible TypeScript library.",
   "type": "module",
   "main": "dist/index.js",
@@ -20,8 +20,7 @@
     "build": "tsc",
     "typecheck": "tsc --noEmit",
     "prepare": "npm run build",
-    "pretest": "npm run build",
-    "test": "node --test test/*.test.js"
+    "test": "npm run build && node --test test/*.test.js"
   },
   "peerDependencies": {
     "@htmltrust/canonicalization": "^0.3.0"

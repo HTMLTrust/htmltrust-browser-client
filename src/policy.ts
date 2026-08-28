@@ -17,6 +17,8 @@ export interface DirectorySubscription {
   url: string;
   /** Multiplier applied to the directory's contribution (typically 0..1). */
   weight: number;
+  /** Disabled subscriptions are retained in settings but never queried. */
+  enabled?: boolean;
 }
 
 export interface TrustPolicy {
@@ -33,6 +35,8 @@ export interface TrustPolicy {
   thresholds?: { warning: number; trusted: number };
   /** Optional fetch override (for tests, custom transports, etc.). */
   fetch?: typeof fetch;
+  /** Maximum time to wait for one directory response. Defaults to 5 seconds. */
+  directoryTimeoutMs?: number;
 }
 
 export interface TrustInput {
@@ -57,25 +61,59 @@ interface DirectoryReputation {
   reports: number;
 }
 
+const DEFAULT_DIRECTORY_TIMEOUT_MS = 5000;
+
+function validScore(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1;
+}
+
 async function fetchReputation(
   baseUrl: string,
   keyid: string,
   fetchImpl: typeof fetch,
+  timeoutMs: number,
 ): Promise<DirectoryReputation | null> {
   // Best-effort: any failure (network, parsing, non-OK status) yields null
   // so the directory simply doesn't contribute. Reputation queries are an
   // optional input, never a hard dependency.
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    const url = `${baseUrl.replace(/\/$/, "")}/keys/${encodeURIComponent(keyid)}/reputation`;
-    const res = await fetchImpl(url);
+    const parsedBase = new URL(baseUrl.trim());
+    if (
+      (parsedBase.protocol !== "https:" && parsedBase.protocol !== "http:") ||
+      parsedBase.username ||
+      parsedBase.password ||
+      parsedBase.search ||
+      parsedBase.hash ||
+      !parsedBase.hostname
+    ) return null;
+    parsedBase.pathname = `${parsedBase.pathname.replace(/\/+$/, "")}/signers/${encodeURIComponent(keyid)}/reputation`;
+    const url = parsedBase.toString();
+    const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
+    timer = setTimeout(() => controller?.abort(), timeoutMs);
+    const res = await fetchImpl(url, {
+        credentials: "omit",
+        referrer: "",
+        referrerPolicy: "no-referrer",
+        redirect: "error",
+        ...(controller ? { signal: controller.signal } : {}),
+      });
     if (!res.ok) return null;
-    const data = (await res.json()) as Partial<DirectoryReputation>;
+    const data = (await res.json()) as Partial<DirectoryReputation> & { score?: unknown };
+    // The normative route uses `score`; accept the pre-v1 `trustScore` field
+    // only for callers that still point at an older compatible directory.
+    const trustScore = validScore(data.score) ? data.score : data.trustScore;
+    if (!validScore(trustScore)) return null;
     return {
-      trustScore: typeof data.trustScore === "number" ? data.trustScore : 0.5,
-      reports: typeof data.reports === "number" ? data.reports : 0,
+      trustScore,
+      reports: typeof data.reports === "number" && Number.isFinite(data.reports) && data.reports >= 0
+        ? data.reports
+        : 0,
     };
   } catch {
     return null;
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
   }
 }
 
@@ -163,8 +201,14 @@ export async function evaluateTrustPolicy(
         "evaluateTrustPolicy: directorySubscriptions configured but no fetch implementation available",
       );
     }
-    const repPromises = subs.map((sub) =>
-      fetchReputation(sub.url, verifyResult.keyid, fetchImpl).then((rep) => ({ sub, rep })),
+    const timeoutMs = Number.isFinite(policy.directoryTimeoutMs) && (policy.directoryTimeoutMs ?? 0) > 0
+      ? policy.directoryTimeoutMs!
+      : DEFAULT_DIRECTORY_TIMEOUT_MS;
+    const repPromises = subs
+      .filter((sub) => sub.enabled !== false && typeof sub.url === "string" && sub.url.trim().length > 0)
+      .filter((sub) => Number.isFinite(sub.weight) && sub.weight >= 0 && sub.weight <= 1)
+      .map((sub) =>
+      fetchReputation(sub.url, verifyResult.keyid, fetchImpl, timeoutMs).then((rep) => ({ sub, rep })),
     );
     const reps = await Promise.all(repPromises);
     for (const { sub, rep } of reps) {
@@ -191,7 +235,7 @@ export async function evaluateTrustPolicy(
     inputs.push({
       source: "directory-reports-override",
       contribution: 0,
-      rationale: `${totalReports} report(s) across subscribed directories — indicator forced to red`,
+      rationale: `${totalReports} report(s) across subscribed directories; indicator forced to red`,
     });
   }
 

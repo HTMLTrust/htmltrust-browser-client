@@ -26,13 +26,33 @@ npm run build
 
 The build writes JavaScript, declarations, and source maps to `dist/`. The package downloads canonicalization v0.3.0 from the immutable `5e51040dcaaf50935e245702bdefbc18a1d542ce` revision, so this repository installs without a sibling checkout.
 
+When developing the client alongside the browser extension or E2E harness, use
+the sibling layout below. The extension uses a pinned Git dependency, while the
+E2E harness uses local `file:` dependencies, so build this package before
+installing either sibling:
+
+```sh
+git clone https://github.com/HTMLTrust/htmltrust-canonicalization.git ../htmltrust-canonicalization
+git clone https://github.com/HTMLTrust/htmltrust-browser-reference.git ../htmltrust-browser-reference
+git clone https://github.com/HTMLTrust/htmltrust-e2e.git ../htmltrust-e2e
+npm ci
+npm run build
+```
+
+The canonicalization checkout is only needed for the E2E harness, whose local
+dependency points at `../htmltrust-canonicalization/javascript`. It is not
+needed for this package's own install or tests.
+
 To install the package directly from Git in another project:
 
 ```sh
-npm install https://github.com/HTMLTrust/htmltrust-browser-client.git
+CLIENT_REV=REPLACE_WITH_REVIEWED_FULL_SHA
+npm install "git+https://github.com/HTMLTrust/htmltrust-browser-client.git#$CLIENT_REV"
 ```
 
-The `prepare` script builds `dist/` during Git installation, so consumers do not need a generated directory committed to the repository.
+Use a 40-character commit SHA or a release tag that you reviewed. The
+`prepare` script builds `dist/` during Git installation, so consumers do not
+need a generated directory committed to the repository.
 
 ## Status
 
@@ -95,8 +115,8 @@ const trust = await evaluateTrustPolicy(verifyResult, {
   personalTrustList: ["did:web:alice.example", "did:web:bob.example"],
   trustedDomains: ["https://nytimes.com", "https://www.propublica.org"],
   directorySubscriptions: [
-    { url: "https://eff.org/directory", weight: 1.0 },
-    { url: "https://aclu.org/directory", weight: 0.8 },
+    { url: "https://eff.org/directory", weight: 1.0, enabled: true },
+    { url: "https://aclu.org/directory", weight: 0.8, enabled: false },
   ],
   // Future: trustedEndorsers, transitiveDepth, customScoreFn
 });
@@ -112,6 +132,11 @@ const trust = await evaluateTrustPolicy(verifyResult, {
 ```
 
 The `inputs` breakdown is what the UI presents on hover to explain why a given piece of content earned its score.
+
+Enabled directories are queried at the normative `GET /signers/{id}/reputation`
+route. The response uses the directory-specific `score` value in the 0..1
+range. Network failures, timeouts, and malformed responses contribute nothing;
+the cryptographic verification result remains independent of directory policy.
 
 ### Endorsement support
 
