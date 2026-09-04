@@ -75,8 +75,8 @@ test("custom thresholds shift the indicator boundary", async () => {
 
 test("directory positive reputation adds weighted contribution", async () => {
   const { server, base } = await startServer({
-    [`/keys/${encodeURIComponent("did:web:alice.example")}/reputation`]: () => ({
-      body: { trustScore: 1.0, reports: 0 },
+    [`/signers/${encodeURIComponent("did:web:alice.example")}/reputation`]: () => ({
+      body: { score: 1.0 },
     }),
   });
   try {
@@ -93,8 +93,8 @@ test("directory positive reputation adds weighted contribution", async () => {
 
 test("directory negative reputation subtracts", async () => {
   const { server, base } = await startServer({
-    [`/keys/${encodeURIComponent("did:web:alice.example")}/reputation`]: () => ({
-      body: { trustScore: 0.0, reports: 0 },
+    [`/signers/${encodeURIComponent("did:web:alice.example")}/reputation`]: () => ({
+      body: { score: 0.0 },
     }),
   });
   try {
@@ -113,8 +113,8 @@ test("any directory reports → indicator forced to red (override)", async () =>
   // Even with personal-trust + trusted-domain pushing score to 100, a single
   // report flips the indicator to red.
   const { server, base } = await startServer({
-    [`/keys/${encodeURIComponent("did:web:alice.example")}/reputation`]: () => ({
-      body: { trustScore: 0.5, reports: 1 },
+    [`/signers/${encodeURIComponent("did:web:alice.example")}/reputation`]: () => ({
+      body: { score: 0.5, reports: 1 },
     }),
   });
   try {
@@ -142,13 +142,13 @@ test("directory failure is best-effort (no contribution, no throw)", async () =>
 
 test("multiple directories aggregate reports for override", async () => {
   const { server: s1, base: b1 } = await startServer({
-    [`/keys/${encodeURIComponent("did:web:alice.example")}/reputation`]: () => ({
-      body: { trustScore: 0.8, reports: 0 },
+    [`/signers/${encodeURIComponent("did:web:alice.example")}/reputation`]: () => ({
+      body: { score: 0.8 },
     }),
   });
   const { server: s2, base: b2 } = await startServer({
-    [`/keys/${encodeURIComponent("did:web:alice.example")}/reputation`]: () => ({
-      body: { trustScore: 0.5, reports: 2 },
+    [`/signers/${encodeURIComponent("did:web:alice.example")}/reputation`]: () => ({
+      body: { score: 0.5, reports: 2 },
     }),
   });
   try {
@@ -166,4 +166,100 @@ test("multiple directories aggregate reports for override", async () => {
     await stopServer(s1);
     await stopServer(s2);
   }
+});
+
+test("conflicting directory scores are kept as separate weighted inputs", async () => {
+  const calls = [];
+  const ev = await evaluateTrustPolicy(vr(), {
+    directorySubscriptions: [
+      { url: "https://directory-a.example", weight: 1 },
+      { url: "https://directory-b.example", weight: 1 },
+    ],
+    fetch: async (url) => {
+      calls.push(String(url));
+      const score = String(url).includes("directory-a") ? 1 : 0;
+      return new Response(JSON.stringify({ score }), { status: 200 });
+    },
+  });
+  assert.equal(ev.score, 50);
+  assert.equal(ev.inputs.filter((input) => input.source.startsWith("directory:")).length, 2);
+  assert.equal(calls.length, 2);
+});
+
+test("disabled and malformed subscriptions are not queried", async () => {
+  const calls = [];
+  const ev = await evaluateTrustPolicy(vr(), {
+    directorySubscriptions: [
+      { url: "https://disabled.example", weight: 1, enabled: false },
+      { url: "https://malformed.example", weight: Number.NaN },
+      { url: "https://overweight.example", weight: 1.01 },
+      { url: "file:///local/directory", weight: 1 },
+    ],
+    fetch: async (url) => {
+      calls.push(String(url));
+      return new Response(JSON.stringify({ score: 1 }), { status: 200 });
+    },
+  });
+  assert.equal(ev.score, 50);
+  assert.deepEqual(calls, []);
+});
+
+test("normative score response with malformed score contributes nothing", async () => {
+  const ev = await evaluateTrustPolicy(vr(), {
+    directorySubscriptions: [{ url: "https://directory.example", weight: 1 }],
+    fetch: async () => new Response(JSON.stringify({ score: "high" }), { status: 200 }),
+  });
+  assert.equal(ev.score, 50);
+  assert.equal(ev.indicator, "yellow");
+});
+
+test("directory timeout is best-effort", async () => {
+  const ev = await evaluateTrustPolicy(vr(), {
+    directorySubscriptions: [{ url: "https://slow.example", weight: 1 }],
+    directoryTimeoutMs: 5,
+    fetch: async (_url, init) => new Promise((_resolve, reject) => {
+      init.signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+    }),
+  });
+  assert.equal(ev.score, 50);
+  assert.equal(ev.indicator, "yellow");
+});
+
+test("directory timeout covers a response whose JSON body stalls", async () => {
+  let aborted = false;
+  const ev = await evaluateTrustPolicy(vr(), {
+    directorySubscriptions: [{ url: "https://slow-json.example", weight: 1 }],
+    directoryTimeoutMs: 5,
+    fetch: async (_url, init) => ({
+      ok: true,
+      json: () => new Promise((_resolve, reject) => {
+        init.signal.addEventListener("abort", () => {
+          aborted = true;
+          reject(new Error("aborted while parsing JSON"));
+        }, { once: true });
+      }),
+    }),
+  });
+  assert.equal(aborted, true);
+  assert.equal(ev.score, 50);
+  assert.equal(ev.indicator, "yellow");
+});
+
+test("directory route construction preserves a path prefix and rejects query or fragment bases", async () => {
+  const calls = [];
+  const ev = await evaluateTrustPolicy(vr(), {
+    directorySubscriptions: [
+      { url: "https://directory.example/prefix/", weight: 1 },
+      { url: "https://directory.example/query?tenant=one", weight: 1 },
+      { url: "https://directory.example/fragment#tenant", weight: 1 },
+    ],
+    fetch: async (url) => {
+      calls.push(String(url));
+      return new Response(JSON.stringify({ score: 1 }), { status: 200 });
+    },
+  });
+  assert.equal(ev.score, 70);
+  assert.deepEqual(calls, [
+    "https://directory.example/prefix/signers/did%3Aweb%3Aalice.example/reputation",
+  ]);
 });
