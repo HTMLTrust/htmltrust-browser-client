@@ -33,6 +33,9 @@ import type {
   VerificationFailureReason,
   VerificationInputState,
 } from "./spec.js";
+import { checkKeyRevocation, keyidHasForbiddenUrlSyntax, keyidHasUnsupportedScheme, revocationListOrigin } from "./revocation.js";
+import type { RevocationCheckOptions, RevocationStatus } from "./revocation.js";
+import { checkKeyIdentifierBinding } from "./identifier-binding.js";
 
 export interface VerifyOptions {
   /** Resolver chain used to map keyid -> public key. Required. */
@@ -65,6 +68,20 @@ export interface VerifyOptions {
    * When true, write a console.warn diagnostic each time verification fails.
    */
   debug?: boolean;
+  /**
+   * Opt-in: also consult the resolved key's publisher-served revocation
+   * list (spec §9.5-9.9), independent of the key document's own `revoked`
+   * field. Off by default so a caller who does not opt in sees no new
+   * network activity and no behavior change from prior versions of this
+   * package. A "revoked" list result fails verification the same way
+   * `revoked: true` in the key document does; a "revocation-unknown"
+   * result does not fail verification but is reported via
+   * {@link VerifyResult.revocationStatus} so callers can decide how to
+   * treat it (spec §9.9, mirrors `directory-unavailable`).
+   */
+  checkRevocationList?: boolean;
+  /** Fetch/cache options for the revocation-list check above. */
+  revocationOptions?: Omit<RevocationCheckOptions, "keyResolvers">;
 }
 
 export interface VerifyResult {
@@ -85,6 +102,29 @@ export interface VerifyResult {
   inputState: VerificationInputState;
   /** Populated when valid === false. */
   reason?: VerificationFailureReason;
+  /**
+   * Only present when `options.checkRevocationList` was true. "revoked"
+   * always coincides with `valid === false` and `reason === "key-revoked"`.
+   * "revocation-unknown" does NOT by itself make `valid` false; callers
+   * MUST NOT treat it the same as "not-revoked" (spec §9.9).
+   */
+  revocationStatus?: RevocationStatus;
+  /** True when the revocation list marks the resolved key superseded. Metadata only; does not affect `valid`. */
+  keySuperseded?: boolean;
+  /** Successor keyid, when the revocation list's superseded entry supplied one. */
+  supersededBy?: string;
+  /**
+   * `true` only when `valid` is true AND `revocationStatus` is
+   * `"not-revoked"`. `undefined` when no revocation list applies at all
+   * (`options.checkRevocationList` was not set, or `revocationStatus`
+   * itself is `undefined`) -- "no information," not "clean." `false` in
+   * every other case, including `revocationStatus === "revocation-unknown"`.
+   * `valid` alone is a Layer 1 cryptographic result only; a caller that
+   * wants to know whether content is safe to present as fully verified,
+   * accounting for revocation, MUST use `fullyVerified` or check
+   * `revocationStatus` itself, not `valid` in isolation.
+   */
+  fullyVerified?: boolean;
 }
 
 type ParsedSection = {
@@ -605,6 +645,11 @@ export async function verifySignedSection(
     origin,
     inputState,
     reason,
+    // Every empty() result has valid === false, so fullyVerified is always
+    // false here, unambiguously -- never undefined. Undefined is reserved
+    // for an otherwise-valid result where no revocation list applied at
+    // all; a cryptographic failure is never ambiguous about being unverified.
+    fullyVerified: false,
     ...partial,
   });
 
@@ -634,6 +679,25 @@ export async function verifySignedSection(
   if (Object.values(protocolAttributes).some((value) => !value || protocolAttributeHasEdgeWhitespace(value))) {
     warn("incomplete", { attributes: Object.fromEntries(Object.entries(protocolAttributes).map(([name, value]) => [name, value !== ""])) });
     return empty("incomplete");
+  }
+  // Spec §5.1/§8: keyid MUST be either an absolute URL or a did: URI --
+  // nothing else is a supported resolution method. Without this, an opaque
+  // string like "alice" is silently accepted by the pinned trust-directory
+  // resolver (which URL-encodes and appends whatever it is given, with no
+  // shape validation of its own) and has no derivable revocation-list
+  // origin, so it evades revocation-list consultation entirely instead of
+  // failing loudly.
+  if (keyidHasUnsupportedScheme(keyid)) {
+    warn("key-resolution-failed", { keyid, reason: "keyid-unsupported-scheme" });
+    return empty("key-resolution-failed");
+  }
+  // Spec §5.1: a query or fragment on a URL-form keyid is forbidden outright
+  // (did:web is unaffected -- its fragment selects a verification method).
+  // Checked here, before any resolution is attempted, so an alias keyid
+  // relying on a query/fragment suffix never reaches Step 5 at all.
+  if (keyidHasForbiddenUrlSyntax(keyid)) {
+    warn("key-resolution-failed", { keyid, reason: "keyid-forbidden-url-syntax" });
+    return empty("key-resolution-failed");
   }
   if (profile !== "htmltrust-signature-v1") {
     warn("profile-unsupported", { profile });
@@ -774,10 +838,79 @@ export async function verifySignedSection(
     return empty("key-revoked", { claimsHash });
   }
 
+  // Spec §9.5-9.9: a second, independent revocation channel, opt-in so a
+  // caller who has not asked for it sees no new network activity. A
+  // "revoked" list result fails closed exactly like the key document's own
+  // `revoked` field above. A "revocation-unknown" result does NOT fail
+  // Layer 1 by itself; it is surfaced on the result for the caller's trust
+  // layer to act on (a transient fetch failure must not make otherwise-valid
+  // content look forged). `undefined` (no derivable revocation-list origin,
+  // e.g. a non-did:web DID keyid) means no fetch was attempted at all, and
+  // is left unset on the result exactly like the opt-in-off case below.
+  let revocationStatus: RevocationStatus | undefined;
+  let keySuperseded: boolean | undefined;
+  let supersededBy: string | undefined;
+  if (options.checkRevocationList) {
+    // Interim closure of the cross-host alias residual (spec §8.1/§8.2):
+    // a key document served under an alias hostname the verifier was
+    // never told is the same identity detaches the resolved key from its
+    // own revocation list, since the list is discovered from whichever
+    // origin the keyid text itself names. Checked as a prerequisite here,
+    // not unconditionally in Step 5, because it is what makes revocation-
+    // list consultation trustworthy in the first place -- without
+    // checkRevocationList there is no revocation check for an alias to
+    // evade, so paying for the extra fetch only when it buys something is
+    // the right tradeoff, matching this feature's existing opt-in design.
+    //
+    // Gated on `keyid` actually having a derivable revocation-list origin:
+    // a did:key (or any other non-did:web, non-https) keyid a configured
+    // resolver understands has none, and MUST NOT be rejected by this
+    // check -- checkKeyRevocation already reports that case as "no list
+    // applies" (undefined, not revocation-unknown), and binding must agree
+    // rather than force-failing verification for a keyid form it was never
+    // meant to gate.
+    if (revocationListOrigin(keyid) !== null) {
+      const binding = await checkKeyIdentifierBinding(keyid, {
+        fetch: options.revocationOptions?.fetch,
+        allowInsecureHttpForTesting: options.revocationOptions?.allowInsecureHttpForTesting,
+        sameOriginSourceRefetch: options.revocationOptions?.sameOriginSourceRefetch,
+        origin: options.revocationOptions?.origin,
+        now: options.revocationOptions?.now,
+        cache: options.revocationOptions?.bindingCache,
+      });
+      if (!binding.ok) {
+        warn(binding.reason, { keyid, reason: "key-identifier-binding-failed" });
+        return empty(binding.reason, { claimsHash });
+      }
+    }
+
+    const revocation = await checkKeyRevocation(keyid, resolved, {
+      ...options.revocationOptions,
+      keyResolvers: options.keyResolvers,
+    });
+    if (revocation) {
+      revocationStatus = revocation.status;
+      keySuperseded = revocation.superseded;
+      supersededBy = revocation.supersededBy;
+    }
+    if (revocation?.status === "revoked") {
+      warn("key-revoked", { keyid, revocationListStatus: "revoked", revokedAt: revocation.revokedAt });
+      return empty("key-revoked", { claimsHash, revocationStatus: "revoked" });
+    }
+  }
+
   const resolvedAlgorithm = resolved.algorithm || "";
   if (resolvedAlgorithm !== algorithm) {
     warn("algorithm-mismatch", { resolvedAlgorithm, algorithm });
-    return empty("algorithm-mismatch", { claimsHash, algorithm: resolvedAlgorithm });
+    return empty("algorithm-mismatch", {
+      claimsHash,
+      algorithm: resolvedAlgorithm,
+      // Trivial to carry forward: the revocation check above (when it ran)
+      // already computed these before this later, unrelated failure.
+      ...(revocationStatus !== undefined ? { revocationStatus } : {}),
+      ...(keySuperseded !== undefined ? { keySuperseded } : {}),
+      ...(supersededBy !== undefined ? { supersededBy } : {}),
+    });
   }
 
   if (algorithm.startsWith("rsa-")) {
@@ -808,6 +941,9 @@ export async function verifySignedSection(
     return empty("signature-invalid", {
       claimsHash,
       algorithm,
+      ...(revocationStatus !== undefined ? { revocationStatus } : {}),
+      ...(keySuperseded !== undefined ? { keySuperseded } : {}),
+      ...(supersededBy !== undefined ? { supersededBy } : {}),
     });
   }
 
@@ -822,5 +958,14 @@ export async function verifySignedSection(
     domain: origin,
     origin,
     inputState,
+    ...(revocationStatus !== undefined ? { revocationStatus } : {}),
+    ...(keySuperseded !== undefined ? { keySuperseded } : {}),
+    ...(supersededBy !== undefined ? { supersededBy } : {}),
+    // valid is true at this point. fullyVerified is undefined ("no
+    // information") only when no revocation list applied at all; true only
+    // when the list was consulted and reported not-revoked; false for
+    // "revocation-unknown" (revoked cannot co-occur with valid === true --
+    // that path already returned above).
+    fullyVerified: revocationStatus === undefined ? undefined : revocationStatus === "not-revoked",
   };
 }
