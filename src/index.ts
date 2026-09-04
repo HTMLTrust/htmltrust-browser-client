@@ -58,3 +58,18 @@ export type {
   VerificationFailureReason,
   VerificationInputState,
 } from "./spec.js";
+
+export {
+  checkKeyRevocation,
+  createRevocationCache,
+  revocationListOrigin,
+  DEFAULT_MAX_STALENESS_MS,
+} from "./revocation.js";
+export type {
+  RevocationCache,
+  RevocationCheckOptions,
+  RevocationCheckResult,
+  RevocationDocument,
+  RevocationEntry,
+  RevocationStatus,
+} from "./revocation.js";

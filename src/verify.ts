@@ -33,6 +33,8 @@ import type {
   VerificationFailureReason,
   VerificationInputState,
 } from "./spec.js";
+import { checkKeyRevocation } from "./revocation.js";
+import type { RevocationCheckOptions, RevocationStatus } from "./revocation.js";
 
 export interface VerifyOptions {
   /** Resolver chain used to map keyid -> public key. Required. */
@@ -65,6 +67,20 @@ export interface VerifyOptions {
    * When true, write a console.warn diagnostic each time verification fails.
    */
   debug?: boolean;
+  /**
+   * Opt-in: also consult the resolved key's publisher-served revocation
+   * list (spec §9.5-9.9), independent of the key document's own `revoked`
+   * field. Off by default so a caller who does not opt in sees no new
+   * network activity and no behavior change from prior versions of this
+   * package. A "revoked" list result fails verification the same way
+   * `revoked: true` in the key document does; a "revocation-unknown"
+   * result does not fail verification but is reported via
+   * {@link VerifyResult.revocationStatus} so callers can decide how to
+   * treat it (spec §9.9, mirrors `directory-unavailable`).
+   */
+  checkRevocationList?: boolean;
+  /** Fetch/cache options for the revocation-list check above. */
+  revocationOptions?: Omit<RevocationCheckOptions, "keyResolvers">;
 }
 
 export interface VerifyResult {
@@ -85,6 +101,17 @@ export interface VerifyResult {
   inputState: VerificationInputState;
   /** Populated when valid === false. */
   reason?: VerificationFailureReason;
+  /**
+   * Only present when `options.checkRevocationList` was true. "revoked"
+   * always coincides with `valid === false` and `reason === "key-revoked"`.
+   * "revocation-unknown" does NOT by itself make `valid` false; callers
+   * MUST NOT treat it the same as "not-revoked" (spec §9.9).
+   */
+  revocationStatus?: RevocationStatus;
+  /** True when the revocation list marks the resolved key superseded. Metadata only; does not affect `valid`. */
+  keySuperseded?: boolean;
+  /** Successor keyid, when the revocation list's superseded entry supplied one. */
+  supersededBy?: string;
 }
 
 type ParsedSection = {
@@ -774,6 +801,30 @@ export async function verifySignedSection(
     return empty("key-revoked", { claimsHash });
   }
 
+  // Spec §9.5-9.9: a second, independent revocation channel, opt-in so a
+  // caller who has not asked for it sees no new network activity. A
+  // "revoked" list result fails closed exactly like the key document's own
+  // `revoked` field above. A "revocation-unknown" result does NOT fail
+  // Layer 1 by itself; it is surfaced on the result for the caller's trust
+  // layer to act on (a transient fetch failure must not make otherwise-valid
+  // content look forged).
+  let revocationStatus: RevocationStatus | undefined;
+  let keySuperseded: boolean | undefined;
+  let supersededBy: string | undefined;
+  if (options.checkRevocationList) {
+    const revocation = await checkKeyRevocation(keyid, {
+      ...options.revocationOptions,
+      keyResolvers: options.keyResolvers,
+    });
+    revocationStatus = revocation.status;
+    keySuperseded = revocation.superseded;
+    supersededBy = revocation.supersededBy;
+    if (revocation.status === "revoked") {
+      warn("key-revoked", { keyid, revocationListStatus: "revoked", revokedAt: revocation.revokedAt });
+      return empty("key-revoked", { claimsHash, revocationStatus: "revoked" });
+    }
+  }
+
   const resolvedAlgorithm = resolved.algorithm || "";
   if (resolvedAlgorithm !== algorithm) {
     warn("algorithm-mismatch", { resolvedAlgorithm, algorithm });
@@ -822,5 +873,8 @@ export async function verifySignedSection(
     domain: origin,
     origin,
     inputState,
+    ...(revocationStatus !== undefined ? { revocationStatus } : {}),
+    ...(keySuperseded !== undefined ? { keySuperseded } : {}),
+    ...(supersededBy !== undefined ? { supersededBy } : {}),
   };
 }
