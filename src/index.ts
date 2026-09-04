@@ -63,10 +63,14 @@ export {
   checkKeyRevocation,
   createRevocationCache,
   revocationListOrigin,
+  canonicalKeyidForm,
+  keyidHasForbiddenUrlSyntax,
+  spkiHash,
   DEFAULT_MAX_STALENESS_MS,
 } from "./revocation.js";
 export type {
   RevocationCache,
+  RevocationCheckKey,
   RevocationCheckOptions,
   RevocationCheckResult,
   RevocationDocument,

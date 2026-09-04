@@ -1,6 +1,7 @@
 /**
  * Publisher-served revocation list (spec §9.5-9.9): fetch outcomes, both
- * per-key states, caching, and the verifySignedSection opt-in integration.
+ * per-key states, caching, keyid-alias immunity, and the
+ * verifySignedSection opt-in integration.
  *
  * Route handlers below are written as closures over `let` variables that
  * are assigned right after `startServer` resolves (once `base` is known),
@@ -11,10 +12,14 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import {
   checkKeyRevocation,
   createRevocationCache,
   revocationListOrigin,
+  canonicalKeyidForm,
+  keyidHasForbiddenUrlSyntax,
+  spkiHash,
   DEFAULT_MAX_STALENESS_MS,
   directUrlResolver,
   verifySignedSection,
@@ -31,6 +36,12 @@ function signRevocationDoc(doc, privateKey) {
 
 function resolvers() {
   return [directUrlResolver({ allowInsecureHttpForTesting: true })];
+}
+
+/** Independent SHA-256 SPKI-DER hash, computed without going through the module under test. */
+function nodeSpkiHash(publicKey) {
+  const der = publicKey.export({ type: "spki", format: "der" });
+  return createHash("sha256").update(der).digest("base64").replace(/=+$/, "");
 }
 
 // === Origin derivation (spec §9.5) ===
@@ -67,12 +78,76 @@ test("revocationListOrigin: a keyid whose origin matches a configured directory 
   );
 });
 
+// === Canonical keyid comparison form (spec §8.5) ===
+
+test("canonicalKeyidForm: URL aliases (dot-segments, host case, default port) collapse to one form", () => {
+  const canonical = canonicalKeyidForm("https://keys.example/alice-2024.json");
+  assert.equal(canonicalKeyidForm("https://keys.example/./alice-2024.json"), canonical);
+  assert.equal(canonicalKeyidForm("https://keys.example/x/../alice-2024.json"), canonical);
+  assert.equal(canonicalKeyidForm("https://KEYS.EXAMPLE/alice-2024.json"), canonical);
+  assert.equal(canonicalKeyidForm("https://keys.example:443/alice-2024.json"), canonical);
+});
+
+test("canonicalKeyidForm: strips a URL keyid's fragment", () => {
+  assert.equal(
+    canonicalKeyidForm("https://keys.example/alice.json#x"),
+    canonicalKeyidForm("https://keys.example/alice.json"),
+  );
+});
+
+test("canonicalKeyidForm: lowercases a did:web host but preserves path and fragment verbatim", () => {
+  assert.equal(canonicalKeyidForm("did:web:EXAMPLE.com"), "did:web:example.com");
+  assert.equal(
+    canonicalKeyidForm("did:web:EXAMPLE.com#Key-1"),
+    "did:web:example.com#Key-1",
+    "a did:web fragment selects a verification method and must not be case-folded away",
+  );
+  assert.equal(
+    canonicalKeyidForm("did:web:EXAMPLE.com:Path:Segment"),
+    "did:web:example.com:Path:Segment",
+    "did:web path segments are not host components and are preserved verbatim",
+  );
+});
+
+// === keyid syntax restriction (spec §5.1) ===
+
+test("keyidHasForbiddenUrlSyntax: rejects a query or fragment on a URL-form keyid", () => {
+  assert.equal(keyidHasForbiddenUrlSyntax("https://keys.example/alice.json?"), true);
+  assert.equal(keyidHasForbiddenUrlSyntax("https://keys.example/alice.json?x=1"), true);
+  assert.equal(keyidHasForbiddenUrlSyntax("https://keys.example/alice.json#x"), true);
+});
+
+test("keyidHasForbiddenUrlSyntax: does not flag a plain URL keyid or any did:web keyid", () => {
+  assert.equal(keyidHasForbiddenUrlSyntax("https://keys.example/alice.json"), false);
+  assert.equal(keyidHasForbiddenUrlSyntax("did:web:example.com"), false);
+  assert.equal(
+    keyidHasForbiddenUrlSyntax("did:web:example.com#key-1"),
+    false,
+    "a did:web fragment selects a verification method and is normal, not forbidden",
+  );
+});
+
+// === publicKeyHash (spec §9.6) ===
+
+test("spkiHash: two different keys hash differently; the same key hashes the same way twice", async () => {
+  const a = generateKey();
+  const b = generateKey();
+  const hashA1 = await spkiHash(a.pem);
+  const hashA2 = await spkiHash(a.pem);
+  const hashB = await spkiHash(b.pem);
+  assert.equal(hashA1, hashA2);
+  assert.notEqual(hashA1, hashB);
+  assert.equal(hashA1, nodeSpkiHash(a.publicKey), "must match an independent computation");
+});
+
 // === Fetch semantics (spec §9.9) ===
 
 test("checkKeyRevocation: HTTP 404 is not-revoked", async () => {
   const { server, base } = await startServer({});
   try {
-    const result = await checkKeyRevocation(`${base}/alice.json`, {
+    // Resolved key is irrelevant here: a 404 short-circuits before any hash
+    // comparison is attempted.
+    const result = await checkKeyRevocation(`${base}/alice.json`, { publicKeyPem: "unused" }, {
       keyResolvers: [],
       allowInsecureHttpForTesting: true,
     });
@@ -82,26 +157,28 @@ test("checkKeyRevocation: HTTP 404 is not-revoked", async () => {
   }
 });
 
-test("checkKeyRevocation: revoked entry matching the checked keyid", async () => {
+test("checkKeyRevocation: matches a revoked entry by publicKeyHash, not by keyid text", async () => {
   const { privateKey, pem } = generateKey();
-  let doc; // assigned once `base` is known, read by the route closure at request time
+  const { pem: targetPem, publicKey: targetPublicKey } = generateKey();
+  const targetHash = nodeSpkiHash(targetPublicKey);
+  let doc;
   const { server, base } = await startServer({
     "/signer.json": () => ({ body: { publicKey: pem, algorithm: "ed25519" } }),
     "/.well-known/htmltrust-revocations.json": () => ({ body: doc }),
   });
   try {
     const signerKeyid = `${base}/signer.json`;
-    const targetKeyid = `${base}/alice-2024.json`;
+    const entryKeyid = `${base}/alice-2024.json`;
     doc = signRevocationDoc(
       {
         signer: signerKeyid,
         algorithm: "ed25519",
         timestamp: "2026-06-01T00:00:00Z",
-        revocations: [{ keyid: targetKeyid, status: "revoked", revokedAt: "2026-05-30T00:00:00Z" }],
+        revocations: [{ keyid: entryKeyid, status: "revoked", revokedAt: "2026-05-30T00:00:00Z", publicKeyHash: targetHash }],
       },
       privateKey,
     );
-    const result = await checkKeyRevocation(targetKeyid, {
+    const result = await checkKeyRevocation(entryKeyid, { publicKeyPem: targetPem }, {
       keyResolvers: resolvers(),
       allowInsecureHttpForTesting: true,
     });
@@ -111,8 +188,113 @@ test("checkKeyRevocation: revoked entry matching the checked keyid", async () =>
   }
 });
 
+test("checkKeyRevocation: KEYID-ALIAS REGRESSION -- a differently-spelled keyid resolving to the SAME key material is still revoked", async () => {
+  // This is the exact attack the adversarial review ran: a revocation list
+  // names one keyid spelling; a signature carries a different, differently
+  // resolved-through-URL-normalization spelling of the identical resource.
+  // The fix must catch this by key material regardless of which spelling
+  // reaches checkKeyRevocation.
+  const { privateKey, pem } = generateKey();
+  const { pem: targetPem, publicKey: targetPublicKey } = generateKey();
+  const targetHash = nodeSpkiHash(targetPublicKey);
+  let doc;
+  const { server, base } = await startServer({
+    "/signer.json": () => ({ body: { publicKey: pem, algorithm: "ed25519" } }),
+    "/.well-known/htmltrust-revocations.json": () => ({ body: doc }),
+  });
+  try {
+    const signerKeyid = `${base}/signer.json`;
+    const canonicalEntryKeyid = `${base}/alice-2024.json`;
+    doc = signRevocationDoc(
+      {
+        signer: signerKeyid,
+        algorithm: "ed25519",
+        timestamp: "2026-06-01T00:00:00Z",
+        revocations: [{ keyid: canonicalEntryKeyid, status: "revoked", publicKeyHash: targetHash }],
+      },
+      privateKey,
+    );
+    // A dot-segment alias of canonicalEntryKeyid: a different literal
+    // string, same resolved resource under the URL Standard.
+    const aliasKeyid = `${base}/./alice-2024.json`;
+    assert.notEqual(aliasKeyid, canonicalEntryKeyid, "must actually be a different literal string");
+    const result = await checkKeyRevocation(aliasKeyid, { publicKeyPem: targetPem }, {
+      keyResolvers: resolvers(),
+      allowInsecureHttpForTesting: true,
+    });
+    assert.equal(result.status, "revoked", "hash-based matching must catch the alias regardless of the keyid string checked");
+  } finally {
+    await stopServer(server);
+  }
+});
+
+test("checkKeyRevocation: a publicKeyHash mismatch does not fall back to a false-positive keyid match", async () => {
+  const { privateKey, pem } = generateKey();
+  const { pem: targetPem } = generateKey();
+  const { publicKey: unrelatedPublicKey } = generateKey();
+  let doc;
+  const { server, base } = await startServer({
+    "/signer.json": () => ({ body: { publicKey: pem, algorithm: "ed25519" } }),
+    "/.well-known/htmltrust-revocations.json": () => ({ body: doc }),
+  });
+  try {
+    const signerKeyid = `${base}/signer.json`;
+    const entryKeyid = `${base}/alice-2024.json`;
+    // The entry's keyid textually matches what will be checked, but its
+    // publicKeyHash names a DIFFERENT key than the one that actually
+    // resolved. The primary match must win: this must NOT be revoked.
+    doc = signRevocationDoc(
+      {
+        signer: signerKeyid,
+        algorithm: "ed25519",
+        timestamp: "2026-06-01T00:00:00Z",
+        revocations: [{ keyid: entryKeyid, status: "revoked", publicKeyHash: nodeSpkiHash(unrelatedPublicKey) }],
+      },
+      privateKey,
+    );
+    const result = await checkKeyRevocation(entryKeyid, { publicKeyPem: targetPem }, {
+      keyResolvers: resolvers(),
+      allowInsecureHttpForTesting: true,
+    });
+    assert.deepEqual(result, { status: "not-revoked", superseded: false });
+  } finally {
+    await stopServer(server);
+  }
+});
+
+test("checkKeyRevocation: a revoked entry omitting publicKeyHash still matches by canonical keyid (secondary match)", async () => {
+  const { privateKey, pem } = generateKey();
+  const { pem: targetPem } = generateKey();
+  let doc;
+  const { server, base } = await startServer({
+    "/signer.json": () => ({ body: { publicKey: pem, algorithm: "ed25519" } }),
+    "/.well-known/htmltrust-revocations.json": () => ({ body: doc }),
+  });
+  try {
+    const signerKeyid = `${base}/signer.json`;
+    const entryKeyid = `${base}/alice-2024.json`;
+    doc = signRevocationDoc(
+      {
+        signer: signerKeyid,
+        algorithm: "ed25519",
+        timestamp: "2026-06-01T00:00:00Z",
+        revocations: [{ keyid: entryKeyid, status: "revoked" }],
+      },
+      privateKey,
+    );
+    const result = await checkKeyRevocation(entryKeyid, { publicKeyPem: targetPem }, {
+      keyResolvers: resolvers(),
+      allowInsecureHttpForTesting: true,
+    });
+    assert.equal(result.status, "revoked");
+  } finally {
+    await stopServer(server);
+  }
+});
+
 test("checkKeyRevocation: an entry naming a different keyid does not revoke this one", async () => {
   const { privateKey, pem } = generateKey();
+  const { pem: targetPem } = generateKey();
   let doc;
   const { server, base } = await startServer({
     "/signer.json": () => ({ body: { publicKey: pem, algorithm: "ed25519" } }),
@@ -129,7 +311,7 @@ test("checkKeyRevocation: an entry naming a different keyid does not revoke this
       },
       privateKey,
     );
-    const result = await checkKeyRevocation(`${base}/alice.json`, {
+    const result = await checkKeyRevocation(`${base}/alice.json`, { publicKeyPem: targetPem }, {
       keyResolvers: resolvers(),
       allowInsecureHttpForTesting: true,
     });
@@ -139,8 +321,9 @@ test("checkKeyRevocation: an entry naming a different keyid does not revoke this
   }
 });
 
-test("checkKeyRevocation: superseded entry is not-revoked, with supersession as metadata", async () => {
+test("checkKeyRevocation: superseded entry matched by canonical keyid is not-revoked, with supersession as metadata", async () => {
   const { privateKey, pem } = generateKey();
+  const { pem: targetPem } = generateKey();
   let doc;
   const { server, base } = await startServer({
     "/signer.json": () => ({ body: { publicKey: pem, algorithm: "ed25519" } }),
@@ -159,7 +342,7 @@ test("checkKeyRevocation: superseded entry is not-revoked, with supersession as 
       },
       privateKey,
     );
-    const result = await checkKeyRevocation(targetKeyid, {
+    const result = await checkKeyRevocation(targetKeyid, { publicKeyPem: targetPem }, {
       keyResolvers: resolvers(),
       allowInsecureHttpForTesting: true,
     });
@@ -173,8 +356,42 @@ test("checkKeyRevocation: superseded entry is not-revoked, with supersession as 
   }
 });
 
+test("checkKeyRevocation: superseded entry matched by publicKeyHash when present", async () => {
+  const { privateKey, pem } = generateKey();
+  const { pem: targetPem, publicKey: targetPublicKey } = generateKey();
+  const targetHash = nodeSpkiHash(targetPublicKey);
+  let doc;
+  const { server, base } = await startServer({
+    "/signer.json": () => ({ body: { publicKey: pem, algorithm: "ed25519" } }),
+    "/.well-known/htmltrust-revocations.json": () => ({ body: doc }),
+  });
+  try {
+    const signerKeyid = `${base}/signer.json`;
+    const successorKeyid = `${base}/alice-2026.json`;
+    // A completely different keyid string from the one being checked, so
+    // only the publicKeyHash match can find this entry.
+    doc = signRevocationDoc(
+      {
+        signer: signerKeyid,
+        algorithm: "ed25519",
+        timestamp: "2026-06-01T00:00:00Z",
+        revocations: [{ keyid: `${base}/some-other-spelling.json`, status: "superseded", supersededBy: successorKeyid, publicKeyHash: targetHash }],
+      },
+      privateKey,
+    );
+    const result = await checkKeyRevocation(`${base}/alice-2025.json`, { publicKeyPem: targetPem }, {
+      keyResolvers: resolvers(),
+      allowInsecureHttpForTesting: true,
+    });
+    assert.deepEqual(result, { status: "not-revoked", superseded: true, supersededBy: successorKeyid });
+  } finally {
+    await stopServer(server);
+  }
+});
+
 test("checkKeyRevocation: key absent from an otherwise-valid list is not-revoked", async () => {
   const { privateKey, pem } = generateKey();
+  const { pem: targetPem } = generateKey();
   let doc;
   const { server, base } = await startServer({
     "/signer.json": () => ({ body: { publicKey: pem, algorithm: "ed25519" } }),
@@ -186,7 +403,7 @@ test("checkKeyRevocation: key absent from an otherwise-valid list is not-revoked
       { signer: signerKeyid, algorithm: "ed25519", timestamp: "2026-06-01T00:00:00Z", revocations: [] },
       privateKey,
     );
-    const result = await checkKeyRevocation(`${base}/someone-else.json`, {
+    const result = await checkKeyRevocation(`${base}/someone-else.json`, { publicKeyPem: targetPem }, {
       keyResolvers: resolvers(),
       allowInsecureHttpForTesting: true,
     });
@@ -199,6 +416,7 @@ test("checkKeyRevocation: key absent from an otherwise-valid list is not-revoked
 test("checkKeyRevocation: invalid signature is revocation-unknown", async () => {
   const { pem } = generateKey();
   const { privateKey: wrongKey } = generateKey();
+  const { pem: targetPem } = generateKey();
   let doc;
   const { server, base } = await startServer({
     "/signer.json": () => ({ body: { publicKey: pem, algorithm: "ed25519" } }),
@@ -218,7 +436,7 @@ test("checkKeyRevocation: invalid signature is revocation-unknown", async () => 
       },
       wrongKey,
     );
-    const result = await checkKeyRevocation(targetKeyid, {
+    const result = await checkKeyRevocation(targetKeyid, { publicKeyPem: targetPem }, {
       keyResolvers: resolvers(),
       allowInsecureHttpForTesting: true,
     });
@@ -236,7 +454,7 @@ test("checkKeyRevocation: malformed JSON body is revocation-unknown", async () =
     }),
   });
   try {
-    const result = await checkKeyRevocation(`${base}/alice.json`, {
+    const result = await checkKeyRevocation(`${base}/alice.json`, { publicKeyPem: "unused" }, {
       keyResolvers: [],
       allowInsecureHttpForTesting: true,
     });
@@ -251,7 +469,7 @@ test("checkKeyRevocation: HTTP 500 is revocation-unknown", async () => {
     "/.well-known/htmltrust-revocations.json": () => ({ status: 500, body: {} }),
   });
   try {
-    const result = await checkKeyRevocation(`${base}/alice.json`, {
+    const result = await checkKeyRevocation(`${base}/alice.json`, { publicKeyPem: "unused" }, {
       keyResolvers: [],
       allowInsecureHttpForTesting: true,
     });
@@ -262,7 +480,7 @@ test("checkKeyRevocation: HTTP 500 is revocation-unknown", async () => {
 });
 
 test("checkKeyRevocation: network error is revocation-unknown", async () => {
-  const result = await checkKeyRevocation("https://alice.example/key.json", {
+  const result = await checkKeyRevocation("https://alice.example/key.json", { publicKeyPem: "unused" }, {
     keyResolvers: [],
     fetch: async () => {
       throw new Error("simulated network failure");
@@ -273,6 +491,7 @@ test("checkKeyRevocation: network error is revocation-unknown", async () => {
 
 test("checkKeyRevocation: a list signed by an already-revoked signer key is revocation-unknown", async () => {
   const { privateKey, pem } = generateKey();
+  const { pem: targetPem } = generateKey();
   let doc;
   const { server, base } = await startServer({
     // The signer's own key document says it is revoked.
@@ -291,7 +510,7 @@ test("checkKeyRevocation: a list signed by an already-revoked signer key is revo
       },
       privateKey,
     );
-    const result = await checkKeyRevocation(targetKeyid, {
+    const result = await checkKeyRevocation(targetKeyid, { publicKeyPem: targetPem }, {
       keyResolvers: resolvers(),
       allowInsecureHttpForTesting: true,
     });
@@ -304,7 +523,7 @@ test("checkKeyRevocation: a list signed by an already-revoked signer key is revo
 test("checkKeyRevocation: a directory-resolved keyid is revocation-unknown, not not-revoked", async () => {
   const { server, base } = await startServer({});
   try {
-    const result = await checkKeyRevocation(`${base}/keys/abc123`, {
+    const result = await checkKeyRevocation(`${base}/keys/abc123`, { publicKeyPem: "unused" }, {
       keyResolvers: [],
       allowInsecureHttpForTesting: true,
       directoryBaseUrls: [base],
@@ -333,12 +552,12 @@ test("checkKeyRevocation: caches within maxStalenessMs and re-fetches after it",
       now: () => now,
       maxStalenessMs: 1000,
     };
-    await checkKeyRevocation(`${base}/alice.json`, opts);
-    await checkKeyRevocation(`${base}/alice.json`, opts);
+    await checkKeyRevocation(`${base}/alice.json`, { publicKeyPem: "unused" }, opts);
+    await checkKeyRevocation(`${base}/alice.json`, { publicKeyPem: "unused" }, opts);
     assert.equal(fetchCount, 1, "second call within staleness window should use the cache");
 
     now += 2000;
-    await checkKeyRevocation(`${base}/alice.json`, opts);
+    await checkKeyRevocation(`${base}/alice.json`, { publicKeyPem: "unused" }, opts);
     assert.equal(fetchCount, 2, "call after staleness window should re-fetch");
   } finally {
     await stopServer(server);
@@ -400,8 +619,8 @@ test("verifySignedSection: checkRevocationList off by default leaves revocationS
   }
 });
 
-test("verifySignedSection: checkRevocationList on, key revoked via the list fails closed", async () => {
-  const { privateKey, pem } = generateKey();
+test("verifySignedSection: checkRevocationList on, key revoked via the list (by publicKeyHash) fails closed", async () => {
+  const { privateKey, pem, publicKey } = generateKey();
   let revocationDoc;
   const { server, base } = await startServer({
     "/key.json": () => ({ body: { publicKey: pem, algorithm: "ed25519" } }),
@@ -423,7 +642,7 @@ test("verifySignedSection: checkRevocationList on, key revoked via the list fail
         signer: keyid,
         algorithm: "ed25519",
         timestamp: "2026-06-01T00:00:00Z",
-        revocations: [{ keyid, status: "revoked", revokedAt: "2026-05-30T00:00:00Z" }],
+        revocations: [{ keyid, status: "revoked", revokedAt: "2026-05-30T00:00:00Z", publicKeyHash: nodeSpkiHash(publicKey) }],
       },
       privateKey,
     );
@@ -440,6 +659,98 @@ test("verifySignedSection: checkRevocationList on, key revoked via the list fail
   } finally {
     await stopServer(server);
   }
+});
+
+test("verifySignedSection: KEYID-ALIAS REGRESSION -- a section signed with the SAME key but an aliased dot-segment keyid still fails closed", async () => {
+  const { privateKey, pem, publicKey } = generateKey();
+  let revocationDoc;
+  const { server, base } = await startServer({
+    "/key.json": () => ({ body: { publicKey: pem, algorithm: "ed25519" } }),
+    "/.well-known/htmltrust-revocations.json": () => ({ body: revocationDoc }),
+  });
+  try {
+    const canonicalKeyid = `${base}/key.json`;
+    // A dot-segment alias: a different literal keyid string that the URL
+    // Standard resolves to the identical key document.
+    const aliasKeyid = `${base}/./key.json`;
+    assert.notEqual(aliasKeyid, canonicalKeyid);
+    const domain = "https://example.org";
+    const { html } = await buildSigned({
+      privateKey,
+      body: "<p>Body.</p>",
+      claims: { author: "Alice" },
+      signedAt: "2026-04-28T12:00:00Z",
+      domain,
+      keyid: aliasKeyid,
+    });
+    // The revocation list names only the canonical spelling.
+    revocationDoc = signRevocationDoc(
+      {
+        signer: canonicalKeyid,
+        algorithm: "ed25519",
+        timestamp: "2026-06-01T00:00:00Z",
+        revocations: [{ keyid: canonicalKeyid, status: "revoked", publicKeyHash: nodeSpkiHash(publicKey) }],
+      },
+      privateKey,
+    );
+    const result = await verifySignedSection(html, {
+      keyResolvers: [directUrlResolver({ allowInsecureHttpForTesting: true })],
+      domain,
+      hash: sha256HexAsync,
+      checkRevocationList: true,
+      revocationOptions: { allowInsecureHttpForTesting: true },
+    });
+    assert.equal(result.valid, false, "hash-based matching must catch this even though the signed section used a differently-spelled keyid");
+    assert.equal(result.reason, "key-revoked");
+    assert.equal(result.revocationStatus, "revoked");
+  } finally {
+    await stopServer(server);
+  }
+});
+
+test("verifySignedSection: a URL keyid carrying a query component is rejected before resolution (spec §5.1)", async () => {
+  const { privateKey } = generateKey();
+  const domain = "https://example.org";
+  const keyid = "https://keys.example/alice.json?x=1";
+  const { html } = await buildSigned({
+    privateKey,
+    body: "<p>Body.</p>",
+    claims: { author: "Alice" },
+    signedAt: "2026-04-28T12:00:00Z",
+    domain,
+    keyid,
+  });
+  let resolverCalled = false;
+  const result = await verifySignedSection(html, {
+    keyResolvers: [{ resolve: async () => { resolverCalled = true; return null; } }],
+    domain,
+    hash: sha256HexAsync,
+  });
+  assert.equal(result.valid, false);
+  assert.equal(result.reason, "key-resolution-failed");
+  assert.equal(resolverCalled, false, "resolution must not even be attempted");
+});
+
+test("verifySignedSection: a did:web keyid carrying a fragment is still accepted (fragment selects a verification method)", async () => {
+  const domain = "https://example.org";
+  const keyid = "did:web:example.com#key-1";
+  const { privateKey } = generateKey();
+  const { html } = await buildSigned({
+    privateKey,
+    body: "<p>Body.</p>",
+    claims: { author: "Alice" },
+    signedAt: "2026-04-28T12:00:00Z",
+    domain,
+    keyid,
+  });
+  let resolvedKeyid = null;
+  const result = await verifySignedSection(html, {
+    keyResolvers: [{ resolve: async (candidate) => { resolvedKeyid = candidate; return null; } }],
+    domain,
+    hash: sha256HexAsync,
+  });
+  assert.equal(resolvedKeyid, keyid, "resolution must still be attempted for a did:web fragment");
+  assert.equal(result.reason, "key-resolution-failed");
 });
 
 test("verifySignedSection: checkRevocationList on, no list published (404) still verifies with not-revoked", async () => {

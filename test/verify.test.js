@@ -400,8 +400,13 @@ test("verifySignedSection: preserves raw source for opening-tag parser rejection
 test("verifySignedSection: Node string parsing accepts HTML unquoted and escaped attributes", async () => {
   const signature = Buffer.alloc(64).toString("base64").replace(/=+$/u, "");
   let resolvedKeyid = null;
-  const keyid = "https://example.org/key?a=1&b=2";
-  const html = `<signed-section profile=htmltrust-signature-v1 signature-scope=url keyid="https://example.org/key?a=1&amp;b=2" content-hash=sha256:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU signature=${signature} algorithm=ed25519><meta name=signed-at content=2026-01-01T00:00:00Z></signed-section>`;
+  // A path segment containing an HTML-entity-escaped "&", not a query
+  // string: a URL-form keyid with a query or fragment is now forbidden
+  // outright (spec §5.1), so this fixture exercises unquoted-attribute and
+  // entity decoding without relying on a keyid shape that is no longer
+  // valid.
+  const keyid = "https://example.org/key/a&b";
+  const html = `<signed-section profile=htmltrust-signature-v1 signature-scope=url keyid="https://example.org/key/a&amp;b" content-hash=sha256:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU signature=${signature} algorithm=ed25519><meta name=signed-at content=2026-01-01T00:00:00Z></signed-section>`;
   const result = await verifySignedSection(html, {
     documentUrl: "https://example.org/article",
     hash: sha256HexAsync,

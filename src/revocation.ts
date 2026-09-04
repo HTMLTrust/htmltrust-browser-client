@@ -16,10 +16,19 @@
  *   - "revoked": compromise. Absolute and retroactive. Every signature ever
  *     made by the key fails, regardless of its claimed `signed-at`, because
  *     a stolen key can backdate that value and there is no trusted clock to
- *     check it against.
+ *     check it against. Matched PRIMARILY by `publicKeyHash` (the SHA-256 of
+ *     the resolved key's SPKI DER) against the key material a verifier
+ *     already resolved, not by `keyid` text: `keyid` is opaque and
+ *     signer-chosen, and the same key can be resolved under more than one
+ *     spelling (dot-segment path variants, host case, default-port
+ *     omission, ...), so a text-only match is bypassable by construction.
  *   - "superseded": orderly rotation. Existing signatures stay valid; the
  *     key must not sign anything new. This is a Layer 2 policy signal only
- *     and never fails Layer 1 verification.
+ *     and never fails Layer 1 verification. Matched by `publicKeyHash` when
+ *     present, else by the canonical keyid form (`canonicalKeyidForm`) --
+ *     lower stakes than "revoked" since a missed alias here only means the
+ *     supersession signal is not surfaced, not that a forged signature
+ *     passes.
  *
  * Fetch outcomes collapse to three statuses:
  *   - HTTP 404                                   -> "not-revoked"
@@ -36,7 +45,7 @@
 
 import { canonicalizeJson, isKeyRevoked, resolveKey, verifySignature } from "@htmltrust/canonicalization";
 import type { KeyResolver } from "@htmltrust/canonicalization";
-import { isCanonicalBase64, makeVerificationFetch } from "./spec.js";
+import { bytesToUnpaddedBase64, isCanonicalBase64, makeVerificationFetch } from "./spec.js";
 import type { VerificationFetchOptions } from "./spec.js";
 
 export type RevocationStatus = "not-revoked" | "revoked" | "revocation-unknown";
@@ -44,9 +53,20 @@ export type RevocationStatus = "not-revoked" | "revoked" | "revocation-unknown";
 /** Default maximum acceptable cache staleness for a fetched revocation list (spec §9.9). */
 export const DEFAULT_MAX_STALENESS_MS = 24 * 60 * 60 * 1000;
 
+/**
+ * `keyid` is opaque and signer-chosen (spec §8); the same key material can
+ * be resolved under more than one `keyid` string (dot-segment path
+ * variants, host case, default-port omission, ...). Matching a `revoked`
+ * entry against `keyid` text is therefore bypassable by construction: sign
+ * with an alias, and a check keyed to one spelling misses it. `publicKeyHash`
+ * closes this by identifying the key itself, independent of how it was
+ * addressed.
+ */
 export interface RevocationEntry {
   keyid: string;
   status: "revoked" | "superseded";
+  /** SHA-256 of the resolved key's SPKI DER, canonical unpadded Base64 (spec §9.6). REQUIRED for a `revoked` entry to satisfy the primary match. */
+  publicKeyHash?: string;
   revokedAt?: string;
   supersededBy?: string;
   [key: string]: unknown;
@@ -80,7 +100,7 @@ const UNKNOWN: RevocationCheckResult = Object.freeze({ status: "revocation-unkno
 type CachedList =
   | { outcome: "not-found"; fetchedAt: number }
   | { outcome: "unknown"; fetchedAt: number }
-  | { outcome: "ok"; fetchedAt: number; entries: Map<string, RevocationEntry> };
+  | { outcome: "ok"; fetchedAt: number; entries: RevocationEntry[] };
 
 /** Shared across calls so repeated checks against the same origin actually get cached (spec §9.9). */
 export type RevocationCache = Map<string, CachedList>;
@@ -178,9 +198,78 @@ function isRevocationEntry(value: unknown): value is RevocationEntry {
   const v = value as Record<string, unknown>;
   if (typeof v.keyid !== "string" || v.keyid === "") return false;
   if (v.status !== "revoked" && v.status !== "superseded") return false;
+  if (v.publicKeyHash !== undefined && (typeof v.publicKeyHash !== "string" || !isCanonicalBase64(v.publicKeyHash))) {
+    return false;
+  }
   if (v.revokedAt !== undefined && typeof v.revokedAt !== "string") return false;
   if (v.supersededBy !== undefined && typeof v.supersededBy !== "string") return false;
   return true;
+}
+
+/**
+ * Canonical keyid comparison form (spec §8.5). Used only for the
+ * `superseded` lookup and as the secondary `revoked` match for an entry
+ * that omits `publicKeyHash` -- never as a substitute for the hash-based
+ * primary match, and never for the signing/verification binding itself,
+ * which always uses the exact `keyid` attribute value.
+ */
+export function canonicalKeyidForm(keyid: string): string {
+  if (keyid.startsWith("did:web:")) {
+    const afterPrefix = keyid.slice("did:web:".length);
+    const stopIndex = afterPrefix.search(/[/?#]/u);
+    const methodSpecific = stopIndex === -1 ? afterPrefix : afterPrefix.slice(0, stopIndex);
+    const rest = stopIndex === -1 ? "" : afterPrefix.slice(stopIndex);
+    const [host, ...pathParts] = methodSpecific.split(":");
+    const normalizedHost = host.replace(/%3a/gi, "%3A").toLowerCase();
+    return `did:web:${[normalizedHost, ...pathParts].join(":")}${rest}`;
+  }
+  if (/^https?:\/\//i.test(keyid)) {
+    try {
+      const url = new URL(keyid);
+      url.hash = "";
+      return url.href;
+    } catch {
+      return keyid;
+    }
+  }
+  return keyid;
+}
+
+/**
+ * Spec §5.1: a URL-form `keyid` (resolved under §8.2/§8.3) MUST NOT carry a
+ * query or fragment component; a `did:web` `keyid` (§8.1) is unaffected,
+ * since a fragment there is the normal way to select one verification
+ * method from a DID document. Closes the query/fragment alias forms
+ * directly, rather than relying on canonicalization to erase them: a
+ * `keyid` failing this MUST be rejected with `key-resolution-failed`
+ * before resolution is attempted (Step 1 of the verification procedure).
+ */
+export function keyidHasForbiddenUrlSyntax(keyid: string): boolean {
+  if (keyid.startsWith("did:web:")) return false;
+  if (!/^https?:\/\//i.test(keyid)) return false;
+  return keyid.includes("?") || keyid.includes("#");
+}
+
+/** Raw SPKI DER bytes from a PEM-encoded SubjectPublicKeyInfo. */
+function derFromPem(pem: string): Uint8Array {
+  const base64 = pem
+    .replace(/-----BEGIN [^-]+-----/g, "")
+    .replace(/-----END [^-]+-----/g, "")
+    .replace(/\s+/g, "");
+  const bin = atob(base64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}
+
+/** SHA-256 of a resolved key's SPKI DER, canonical unpadded Base64 (spec §9.6 `publicKeyHash`). */
+export async function spkiHash(publicKeyPem: string): Promise<string> {
+  const subtle = (globalThis as { crypto?: { subtle?: SubtleCrypto } }).crypto?.subtle;
+  if (!subtle) {
+    throw new Error("spkiHash: SubtleCrypto is unavailable; provide a runtime with WebCrypto");
+  }
+  const digest = await subtle.digest("SHA-256", derFromPem(publicKeyPem).slice());
+  return bytesToUnpaddedBase64(new Uint8Array(digest));
 }
 
 function isRevocationDocument(value: unknown): value is RevocationDocument {
@@ -261,21 +350,32 @@ async function fetchList(url: string, options: RevocationCheckOptions): Promise<
     return { outcome: "unknown", fetchedAt: now };
   }
 
-  const entries = new Map<string, RevocationEntry>();
-  for (const entry of parsed.revocations) {
-    if (isRevocationEntry(entry)) entries.set(entry.keyid, entry);
-  }
+  const entries = parsed.revocations.filter(isRevocationEntry);
   return { outcome: "ok", fetchedAt: now, entries };
 }
 
 /**
- * Check a `keyid`'s revocation status against its publisher-served
+ * Minimal shape this module needs from a resolved key. `ResolvedKey` from
+ * @htmltrust/canonicalization satisfies this.
+ */
+export interface RevocationCheckKey {
+  publicKeyPem: string;
+}
+
+/**
+ * Check a resolved key's revocation status against its publisher-served
  * revocation list (spec §9.5-9.9). Off the critical path by design: callers
  * decide whether and when to consult this, independent of the key
  * document's own `revoked` field.
+ *
+ * Takes the RESOLVED key, not just `keyid`, because the primary `revoked`
+ * match is by key material (spec §9.7): `keyid` is opaque and signer-chosen,
+ * and a match keyed only to its text is bypassable by resolving the same
+ * key under a different, equally valid spelling of the same identifier.
  */
 export async function checkKeyRevocation(
   keyid: string,
+  resolvedKey: RevocationCheckKey,
   options: RevocationCheckOptions,
 ): Promise<RevocationCheckResult> {
   const origin = revocationListOrigin(keyid, options.directoryBaseUrls ?? []);
@@ -295,10 +395,35 @@ export async function checkKeyRevocation(
   if (cached.outcome === "not-found") return NOT_REVOKED;
   if (cached.outcome === "unknown") return UNKNOWN;
 
-  const entry = cached.entries.get(keyid);
-  if (!entry) return NOT_REVOKED;
-  if (entry.status === "revoked") {
-    return { status: "revoked", superseded: false, revokedAt: entry.revokedAt };
+  const resolvedHash = await spkiHash(resolvedKey.publicKeyPem);
+  const canonicalChecked = canonicalKeyidForm(keyid);
+
+  // Primary match for "revoked": publicKeyHash against the resolved key's
+  // own SPKI hash. Immune to keyid aliasing by construction -- it never
+  // looks at which keyid string reached this key.
+  for (const entry of cached.entries) {
+    if (entry.status === "revoked" && entry.publicKeyHash && entry.publicKeyHash === resolvedHash) {
+      return { status: "revoked", superseded: false, revokedAt: entry.revokedAt };
+    }
   }
-  return { status: "not-revoked", superseded: true, supersededBy: entry.supersededBy };
+  // Secondary match for "revoked": canonical keyid form, only for an entry
+  // that omitted publicKeyHash. Never overrides a hash comparison that
+  // already ran and did not match (spec §9.7).
+  for (const entry of cached.entries) {
+    if (entry.status === "revoked" && !entry.publicKeyHash && canonicalKeyidForm(entry.keyid) === canonicalChecked) {
+      return { status: "revoked", superseded: false, revokedAt: entry.revokedAt };
+    }
+  }
+  // "superseded" is Layer 2 metadata, not a security gate: match by
+  // publicKeyHash when present, else by canonical keyid.
+  for (const entry of cached.entries) {
+    if (entry.status !== "superseded") continue;
+    const matches = entry.publicKeyHash
+      ? entry.publicKeyHash === resolvedHash
+      : canonicalKeyidForm(entry.keyid) === canonicalChecked;
+    if (matches) {
+      return { status: "not-revoked", superseded: true, supersededBy: entry.supersededBy };
+    }
+  }
+  return NOT_REVOKED;
 }

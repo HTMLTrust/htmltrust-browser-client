@@ -33,7 +33,7 @@ import type {
   VerificationFailureReason,
   VerificationInputState,
 } from "./spec.js";
-import { checkKeyRevocation } from "./revocation.js";
+import { checkKeyRevocation, keyidHasForbiddenUrlSyntax } from "./revocation.js";
 import type { RevocationCheckOptions, RevocationStatus } from "./revocation.js";
 
 export interface VerifyOptions {
@@ -662,6 +662,14 @@ export async function verifySignedSection(
     warn("incomplete", { attributes: Object.fromEntries(Object.entries(protocolAttributes).map(([name, value]) => [name, value !== ""])) });
     return empty("incomplete");
   }
+  // Spec §5.1: a query or fragment on a URL-form keyid is forbidden outright
+  // (did:web is unaffected -- its fragment selects a verification method).
+  // Checked here, before any resolution is attempted, so an alias keyid
+  // relying on a query/fragment suffix never reaches Step 5 at all.
+  if (keyidHasForbiddenUrlSyntax(keyid)) {
+    warn("key-resolution-failed", { keyid, reason: "keyid-forbidden-url-syntax" });
+    return empty("key-resolution-failed");
+  }
   if (profile !== "htmltrust-signature-v1") {
     warn("profile-unsupported", { profile });
     return empty("profile-unsupported");
@@ -812,7 +820,7 @@ export async function verifySignedSection(
   let keySuperseded: boolean | undefined;
   let supersededBy: string | undefined;
   if (options.checkRevocationList) {
-    const revocation = await checkKeyRevocation(keyid, {
+    const revocation = await checkKeyRevocation(keyid, resolved, {
       ...options.revocationOptions,
       keyResolvers: options.keyResolvers,
     });
