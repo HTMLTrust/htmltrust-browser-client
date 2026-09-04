@@ -67,6 +67,7 @@ export {
   keyidHasForbiddenUrlSyntax,
   spkiHash,
   DEFAULT_MAX_STALENESS_MS,
+  UNKNOWN_RETRY_MS,
 } from "./revocation.js";
 export type {
   RevocationCache,

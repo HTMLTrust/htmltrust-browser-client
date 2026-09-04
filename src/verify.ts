@@ -815,7 +815,9 @@ export async function verifySignedSection(
   // `revoked` field above. A "revocation-unknown" result does NOT fail
   // Layer 1 by itself; it is surfaced on the result for the caller's trust
   // layer to act on (a transient fetch failure must not make otherwise-valid
-  // content look forged).
+  // content look forged). `undefined` (no derivable revocation-list origin,
+  // e.g. a non-did:web DID keyid) means no fetch was attempted at all, and
+  // is left unset on the result exactly like the opt-in-off case below.
   let revocationStatus: RevocationStatus | undefined;
   let keySuperseded: boolean | undefined;
   let supersededBy: string | undefined;
@@ -824,10 +826,12 @@ export async function verifySignedSection(
       ...options.revocationOptions,
       keyResolvers: options.keyResolvers,
     });
-    revocationStatus = revocation.status;
-    keySuperseded = revocation.superseded;
-    supersededBy = revocation.supersededBy;
-    if (revocation.status === "revoked") {
+    if (revocation) {
+      revocationStatus = revocation.status;
+      keySuperseded = revocation.superseded;
+      supersededBy = revocation.supersededBy;
+    }
+    if (revocation?.status === "revoked") {
       warn("key-revoked", { keyid, revocationListStatus: "revoked", revokedAt: revocation.revokedAt });
       return empty("key-revoked", { claimsHash, revocationStatus: "revoked" });
     }
