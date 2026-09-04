@@ -33,8 +33,9 @@ import type {
   VerificationFailureReason,
   VerificationInputState,
 } from "./spec.js";
-import { checkKeyRevocation, keyidHasForbiddenUrlSyntax } from "./revocation.js";
+import { checkKeyRevocation, keyidHasForbiddenUrlSyntax, keyidHasUnsupportedScheme } from "./revocation.js";
 import type { RevocationCheckOptions, RevocationStatus } from "./revocation.js";
+import { checkKeyIdentifierBinding } from "./identifier-binding.js";
 
 export interface VerifyOptions {
   /** Resolver chain used to map keyid -> public key. Required. */
@@ -112,6 +113,18 @@ export interface VerifyResult {
   keySuperseded?: boolean;
   /** Successor keyid, when the revocation list's superseded entry supplied one. */
   supersededBy?: string;
+  /**
+   * `true` only when `valid` is true AND `revocationStatus` is
+   * `"not-revoked"`. `undefined` when no revocation list applies at all
+   * (`options.checkRevocationList` was not set, or `revocationStatus`
+   * itself is `undefined`) -- "no information," not "clean." `false` in
+   * every other case, including `revocationStatus === "revocation-unknown"`.
+   * `valid` alone is a Layer 1 cryptographic result only; a caller that
+   * wants to know whether content is safe to present as fully verified,
+   * accounting for revocation, MUST use `fullyVerified` or check
+   * `revocationStatus` itself, not `valid` in isolation.
+   */
+  fullyVerified?: boolean;
 }
 
 type ParsedSection = {
@@ -632,6 +645,11 @@ export async function verifySignedSection(
     origin,
     inputState,
     reason,
+    // Every empty() result has valid === false, so fullyVerified is always
+    // false here, unambiguously -- never undefined. Undefined is reserved
+    // for an otherwise-valid result where no revocation list applied at
+    // all; a cryptographic failure is never ambiguous about being unverified.
+    fullyVerified: false,
     ...partial,
   });
 
@@ -661,6 +679,17 @@ export async function verifySignedSection(
   if (Object.values(protocolAttributes).some((value) => !value || protocolAttributeHasEdgeWhitespace(value))) {
     warn("incomplete", { attributes: Object.fromEntries(Object.entries(protocolAttributes).map(([name, value]) => [name, value !== ""])) });
     return empty("incomplete");
+  }
+  // Spec §5.1/§8: keyid MUST be either an absolute URL or a did: URI --
+  // nothing else is a supported resolution method. Without this, an opaque
+  // string like "alice" is silently accepted by the pinned trust-directory
+  // resolver (which URL-encodes and appends whatever it is given, with no
+  // shape validation of its own) and has no derivable revocation-list
+  // origin, so it evades revocation-list consultation entirely instead of
+  // failing loudly.
+  if (keyidHasUnsupportedScheme(keyid)) {
+    warn("key-resolution-failed", { keyid, reason: "keyid-unsupported-scheme" });
+    return empty("key-resolution-failed");
   }
   // Spec §5.1: a query or fragment on a URL-form keyid is forbidden outright
   // (did:web is unaffected -- its fragment selects a verification method).
@@ -822,6 +851,28 @@ export async function verifySignedSection(
   let keySuperseded: boolean | undefined;
   let supersededBy: string | undefined;
   if (options.checkRevocationList) {
+    // Interim closure of the cross-host alias residual (spec §8.1/§8.2):
+    // a key document served under an alias hostname the verifier was
+    // never told is the same identity detaches the resolved key from its
+    // own revocation list, since the list is discovered from whichever
+    // origin the keyid text itself names. Checked as a prerequisite here,
+    // not unconditionally in Step 5, because it is what makes revocation-
+    // list consultation trustworthy in the first place -- without
+    // checkRevocationList there is no revocation check for an alias to
+    // evade, so paying for the extra fetch only when it buys something is
+    // the right tradeoff, matching this feature's existing opt-in design.
+    const binding = await checkKeyIdentifierBinding(keyid, {
+      fetch: options.revocationOptions?.fetch,
+      allowInsecureHttpForTesting: options.revocationOptions?.allowInsecureHttpForTesting,
+      sameOriginSourceRefetch: options.revocationOptions?.sameOriginSourceRefetch,
+      origin: options.revocationOptions?.origin,
+      now: options.revocationOptions?.now,
+    });
+    if (!binding.ok) {
+      warn(binding.reason, { keyid, reason: "key-identifier-binding-failed" });
+      return empty(binding.reason, { claimsHash });
+    }
+
     const revocation = await checkKeyRevocation(keyid, resolved, {
       ...options.revocationOptions,
       keyResolvers: options.keyResolvers,
@@ -888,5 +939,11 @@ export async function verifySignedSection(
     ...(revocationStatus !== undefined ? { revocationStatus } : {}),
     ...(keySuperseded !== undefined ? { keySuperseded } : {}),
     ...(supersededBy !== undefined ? { supersededBy } : {}),
+    // valid is true at this point. fullyVerified is undefined ("no
+    // information") only when no revocation list applied at all; true only
+    // when the list was consulted and reported not-revoked; false for
+    // "revocation-unknown" (revoked cannot co-occur with valid === true --
+    // that path already returned above).
+    fullyVerified: revocationStatus === undefined ? undefined : revocationStatus === "not-revoked",
   };
 }

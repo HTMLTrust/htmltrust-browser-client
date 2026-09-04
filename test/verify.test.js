@@ -16,6 +16,7 @@ import {
   directUrlResolver,
   trustDirectoryResolver,
   isPrivateHost,
+  isLoopbackHost,
 } from "../dist/index.js";
 import { generateKey, sha256Hex, sha256HexAsync, signEd25519, startServer, stopServer } from "./_helpers.js";
 import { buildSigningPayloadV1, canonicalizeClaims as canonicalizeClaimsV1 } from "@htmltrust/canonicalization";
@@ -367,6 +368,24 @@ test("isPrivateHost: classifies loopback, link-local, and RFC 1918 hosts", () =>
   }
 });
 
+test("isPrivateHost: catches the hex-group IPv4-mapped IPv6 form the URL Standard's own serializer actually produces", () => {
+  // new URL("http://[::ffff:10.0.0.1]/x").hostname is "[::ffff:a00:1]", not
+  // the dotted-decimal literal a caller might type -- WHATWG IPv6
+  // serialization never preserves the dotted form. A guard that only
+  // recognizes the dotted form never actually fires on real url.hostname
+  // output.
+  assert.equal(new URL("http://[::ffff:10.0.0.1]/x").hostname, "[::ffff:a00:1]");
+  assert.equal(isPrivateHost("[::ffff:a00:1]"), true, "10.0.0.1 in hex-group form");
+  assert.equal(isPrivateHost("[::ffff:a9fe:a9fe]"), true, "169.254.169.254 (cloud metadata) in hex-group form");
+  assert.equal(isPrivateHost("[::ffff:7f00:1]"), true, "127.0.0.1 in hex-group form");
+  assert.equal(isPrivateHost("[::ffff:808:808]"), false, "8.8.8.8 in hex-group form should be public");
+});
+
+test("isLoopbackHost: catches the hex-group IPv4-mapped IPv6 loopback form too", () => {
+  assert.equal(isLoopbackHost("[::ffff:7f00:1]"), true);
+  assert.equal(isLoopbackHost("[::ffff:a00:1]"), false, "10.0.0.1 is private but not loopback");
+});
+
 test("trustDirectoryResolver: refuses a private-network directory base URL", () => {
   assert.throws(
     () => trustDirectoryResolver({ baseUrls: ["https://10.0.0.5/directory"] }),
@@ -381,7 +400,7 @@ test("trustDirectoryResolver: refuses a private-network directory base URL", () 
 test("verifySignedSection: rejects duplicate normalized claim names", async () => {
   const signature = Buffer.alloc(64).toString("base64").replace(/=+$/u, "");
   const result = await verifySignedSection(
-    `<signed-section profile="htmltrust-signature-v1" signature-scope="url" keyid="x" content-hash="sha256:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU" signature="${signature}" algorithm="ed25519"><meta name="signed-at" content="2026-01-01T00:00:00Z"><meta name="author" content="Alice"><meta name="author" content="Bob"></signed-section>`,
+    `<signed-section profile="htmltrust-signature-v1" signature-scope="url" keyid="https://k.example/k" content-hash="sha256:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU" signature="${signature}" algorithm="ed25519"><meta name="signed-at" content="2026-01-01T00:00:00Z"><meta name="author" content="Alice"><meta name="author" content="Bob"></signed-section>`,
     { keyResolvers: [], domain: "https://example.org", hash: sha256HexAsync },
   );
   assert.equal(result.valid, false);

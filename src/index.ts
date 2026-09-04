@@ -65,8 +65,10 @@ export {
   revocationListOrigin,
   canonicalKeyidForm,
   keyidHasForbiddenUrlSyntax,
+  keyidHasUnsupportedScheme,
   spkiHash,
   DEFAULT_MAX_STALENESS_MS,
+  NOT_FOUND_DEFAULT_MS,
   UNKNOWN_RETRY_MS,
 } from "./revocation.js";
 export type {
@@ -78,3 +80,14 @@ export type {
   RevocationEntry,
   RevocationStatus,
 } from "./revocation.js";
+
+export {
+  checkKeyIdentifierBinding,
+  createIdentifierBindingCache,
+  DEFAULT_BINDING_CACHE_MS,
+} from "./identifier-binding.js";
+export type {
+  IdentifierBindingCache,
+  IdentifierBindingOptions,
+  IdentifierBindingResult,
+} from "./identifier-binding.js";

@@ -20,16 +20,27 @@
  * `checkKeyRevocation` returns `undefined` for that case rather than
  * `revocation-unknown`, since nothing was attempted.
  *
+ * This module alone closes keyid-string aliasing WITHIN one origin (a
+ * dot-segment path variant, host case, default-port omission, ...), by
+ * matching `revoked` on the resolved key's own SPKI hash rather than on
+ * `keyid` text. It does NOT by itself close a CROSS-HOST alias, where a key
+ * document is reachable under a second hostname the verifier was never told
+ * is the same identity (www vs apex, a CDN hostname, an IP literal with a
+ * matching certificate): that closure requires the key document to name its
+ * own canonical identifier, which `../identifier-binding.js` checks
+ * separately. See `verify.ts` for how the two combine.
+ *
  * Two states, and the distinction is the whole point:
  *   - "revoked": compromise. Absolute and retroactive, with no time
  *     condition anywhere: every signature ever made by the key fails,
- *     regardless of its claimed `signed-at`, full stop. Matched PRIMARILY
- *     by `publicKeyHash` (the SHA-256 of the resolved key's SPKI DER)
- *     against the key material a verifier already resolved, not by `keyid`
- *     text: `keyid` is opaque and signer-chosen, and the same key can be
- *     resolved under more than one spelling (dot-segment path variants,
- *     host case, default-port omission, ...), so a text-only match is
- *     bypassable by construction.
+ *     regardless of its claimed `signed-at`, full stop. Matched ONLY by
+ *     `publicKeyHash` (the SHA-256 of the resolved key's SPKI DER) against
+ *     the key material a verifier already resolved, never by `keyid` text:
+ *     `keyid` is opaque and signer-chosen, and the same key can be resolved
+ *     under more than one spelling, so a text-based match is bypassable by
+ *     construction. `publicKeyHash` is REQUIRED on a `revoked` entry; one
+ *     missing it is malformed (spec §9.6) and invalidates the whole
+ *     document, rather than falling back to a weaker text match.
  *   - "superseded": the same orderly-rotation state Section 9.1 already
  *     defines from a key document's own `expires`/`supersededBy` fields,
  *     now assertable through this second, independent channel too.
@@ -51,7 +62,8 @@
  *     signer not itself listed revoked/superseded,
  *     every entry well-formed                     -> apply its entries
  *   - anything else (network error, bad signature,
- *     malformed JSON, a malformed entry anywhere
+ *     malformed JSON (including a duplicate JSON
+ *     member anywhere), a malformed entry anywhere
  *     in the document, signer hosted at a
  *     different origin than the list, signer
  *     already known revoked, signer listed
@@ -66,15 +78,18 @@
  * fourth case: `undefined`, not "revocation-unknown".
  */
 
-import { canonicalizeJson, isKeyRevoked, resolveKey, verifySignature } from "@htmltrust/canonicalization";
+import { canonicalizeJson, canonicalizeJsonDocument, isKeyRevoked, resolveKey, verifySignature } from "@htmltrust/canonicalization";
 import type { KeyResolver } from "@htmltrust/canonicalization";
 import { bytesToUnpaddedBase64, isCanonicalBase64, makeVerificationFetch } from "./spec.js";
 import type { VerificationFetchOptions } from "./spec.js";
 
 export type RevocationStatus = "not-revoked" | "revoked" | "revocation-unknown";
 
-/** Default maximum acceptable cache staleness for a fetched revocation list (spec §9.9); a ceiling on Cache-Control freshness, not a fixed TTL. */
+/** Default maximum acceptable cache freshness for a fetched revocation list (spec §9.9); a ceiling on Cache-Control freshness, not a fixed TTL. */
 export const DEFAULT_MAX_STALENESS_MS = 24 * 60 * 60 * 1000;
+
+/** Default cache freshness for an HTTP 404 (no list published) when no shorter Cache-Control freshness applies -- shorter than DEFAULT_MAX_STALENESS_MS so a publisher's first list after a compromise is not unseen for up to a day. */
+export const NOT_FOUND_DEFAULT_MS = 60 * 60 * 1000;
 
 /** Negative-cache window for a "revocation-unknown" outcome: short, so a transient failure self-heals quickly rather than pinning "unknown" for up to DEFAULT_MAX_STALENESS_MS. */
 export const UNKNOWN_RETRY_MS = 60 * 1000;
@@ -86,12 +101,12 @@ export const UNKNOWN_RETRY_MS = 60 * 1000;
  * entry against `keyid` text is therefore bypassable by construction: sign
  * with an alias, and a check keyed to one spelling misses it. `publicKeyHash`
  * closes this by identifying the key itself, independent of how it was
- * addressed.
+ * addressed, and is REQUIRED on a `revoked` entry for exactly that reason.
  */
 export interface RevocationEntry {
   keyid: string;
   status: "revoked" | "superseded";
-  /** SHA-256 of the resolved key's SPKI DER, canonical unpadded Base64 (spec §9.6). REQUIRED for a `revoked` entry to satisfy the primary match. */
+  /** SHA-256 of the resolved key's SPKI DER, canonical unpadded Base64 (spec §9.6). REQUIRED when `status` is `revoked`; a `revoked` entry omitting it is malformed. OPTIONAL when `status` is `superseded`. */
   publicKeyHash?: string;
   revokedAt?: string;
   supersededBy?: string;
@@ -218,6 +233,10 @@ function isRevocationEntry(value: unknown): value is RevocationEntry {
   if (v.publicKeyHash !== undefined && (typeof v.publicKeyHash !== "string" || !isCanonicalBase64(v.publicKeyHash))) {
     return false;
   }
+  // Spec §9.6: publicKeyHash is REQUIRED for a revoked entry; missing it is
+  // malformed, not a softer degrade to keyid-only matching. There is no
+  // secondary text-based match for "revoked" in this revision.
+  if (v.status === "revoked" && v.publicKeyHash === undefined) return false;
   if (v.revokedAt !== undefined && typeof v.revokedAt !== "string") return false;
   if (v.supersededBy !== undefined && typeof v.supersededBy !== "string") return false;
   return true;
@@ -225,10 +244,10 @@ function isRevocationEntry(value: unknown): value is RevocationEntry {
 
 /**
  * Canonical keyid comparison form (spec §8.5). Used only for the
- * `superseded` lookup and as the secondary `revoked` match for an entry
- * that omits `publicKeyHash` -- never as a substitute for the hash-based
- * primary match, and never for the signing/verification binding itself,
- * which always uses the exact `keyid` attribute value.
+ * `superseded` lookup -- the analogous match for `revoked` is
+ * `publicKeyHash` alone, with no keyid-based fallback -- and never for the
+ * signing/verification binding itself, which always uses the exact `keyid`
+ * attribute value.
  */
 export function canonicalKeyidForm(keyid: string): string {
   if (keyid.startsWith("did:web:")) {
@@ -243,6 +262,13 @@ export function canonicalKeyidForm(keyid: string): string {
   if (/^https?:\/\//i.test(keyid)) {
     try {
       const url = new URL(keyid);
+      // Neither a query nor a fragment carries identity for this
+      // comparison. A signed section's own keyid can never carry either
+      // (spec §5.1 forbids both outright), but an entry's keyid is
+      // author-supplied JSON data, not a validated wire attribute, and MAY
+      // carry one; strip both sides the same way so they still compare
+      // equal.
+      url.search = "";
       url.hash = "";
       return url.href;
     } catch {
@@ -265,6 +291,23 @@ export function keyidHasForbiddenUrlSyntax(keyid: string): boolean {
   if (keyid.startsWith("did:web:")) return false;
   if (!/^https?:\/\//i.test(keyid)) return false;
   return keyid.includes("?") || keyid.includes("#");
+}
+
+/**
+ * Spec §5.1/§8: a `keyid` MUST be either an absolute HTTPS (or, for
+ * testing, HTTP) URL or a `did:` URI; nothing else is a supported
+ * resolution method. Without this check, an opaque string like `"alice"`
+ * is silently accepted by the pinned trust-directory resolver (which
+ * URL-encodes and appends whatever string it is given, with no shape
+ * validation of its own), and such a keyid has no derivable revocation-list
+ * origin, so it evades revocation-list consultation entirely rather than
+ * failing loudly. A `keyid` failing this MUST be rejected with
+ * `key-resolution-failed` before resolution is attempted.
+ */
+export function keyidHasUnsupportedScheme(keyid: string): boolean {
+  if (/^https?:\/\//i.test(keyid)) return false;
+  if (keyid.startsWith("did:")) return false;
+  return true;
 }
 
 /** Raw SPKI DER bytes from a PEM-encoded SubjectPublicKeyInfo. */
@@ -306,40 +349,75 @@ function omitSignature(doc: RevocationDocument): Record<string, unknown> {
 }
 
 /**
- * Cache-Control (and Age) freshness for a 200 or 404 revocation-list
- * response, capped at `maxStaleness`. `no-store`/`no-cache` mean
- * revalidate on the very next call (freshness 0). Absent any directive,
- * freshness defaults to the cap itself, matching this package's existing
- * "cap cached freshness when no explicit information is present" posture
- * for key documents.
+ * Strictly parse a revocation-list response body: rejects a duplicate JSON
+ * member anywhere in the document (top level or within an entry), which
+ * plain `JSON.parse` silently accepts last-wins. Spec §9.8 requires this
+ * (cross-referencing §11.2's JCS conformance rules, which already forbid
+ * it for the sibling endorsement format). Reuses
+ * @htmltrust/canonicalization's own strict JSON parser rather than writing
+ * a second one: `canonicalizeJsonDocument` already rejects a duplicate
+ * member, a lone UTF-16 surrogate, and other RFC 8259 violations before
+ * producing its canonical output, so a successful call here is sufficient
+ * proof the input has none of those problems, independent of the
+ * canonical string itself.
  */
-function freshnessMsFor(res: Response, maxStaleness: number): number {
+function parseRevocationDocumentStrict(body: string): unknown {
+  const canonical = canonicalizeJsonDocument(body);
+  return JSON.parse(canonical);
+}
+
+/**
+ * Cache-Control (`max-age`/`s-maxage`), `Expires`, and `Age` freshness for a
+ * 200 or 404 revocation-list response, capped at `maxStaleness`.
+ * `no-store`/`no-cache` mean revalidate on the very next call (freshness
+ * 0). An unparseable freshness value -- a malformed `max-age`/`s-maxage`
+ * token (including a quoted one, which RFC 9111's grammar does not permit)
+ * or an unparseable `Expires` value -- is treated as 0, not as though no
+ * value were present at all: a value a verifier cannot make sense of is
+ * untrusted, not a reason to fall back to the generous default. Only the
+ * genuine absence of any freshness information falls back to
+ * `defaultWhenAbsentMs`.
+ */
+function freshnessMsFor(res: Response, maxStaleness: number, defaultWhenAbsentMs: number, now: number): number {
   const header = res.headers.get?.("cache-control") ?? "";
-  const directives = header.split(",").map((d) => d.trim().toLowerCase());
-  if (directives.includes("no-store") || directives.some((d) => d === "no-cache" || d.startsWith("no-cache="))) {
+  const directives = header.split(",").map((d) => d.trim());
+  if (directives.some((d) => d.toLowerCase() === "no-store")) return 0;
+  if (directives.some((d) => { const l = d.toLowerCase(); return l === "no-cache" || l.startsWith("no-cache="); })) {
     return 0;
   }
-  let maxAgeSeconds: number | null = null;
-  for (const d of directives) {
-    const match = /^s-maxage=(\d+)$/.exec(d);
-    if (match) {
-      maxAgeSeconds = Number(match[1]);
-      break;
-    }
-  }
-  if (maxAgeSeconds === null) {
+
+  const parseAgeDirective = (name: string): { present: boolean; seconds: number | null } => {
     for (const d of directives) {
-      const match = /^max-age=(\d+)$/.exec(d);
-      if (match) {
-        maxAgeSeconds = Number(match[1]);
-        break;
-      }
+      const eq = d.indexOf("=");
+      if (eq === -1) continue;
+      if (d.slice(0, eq).trim().toLowerCase() !== name) continue;
+      const value = d.slice(eq + 1).trim();
+      return { present: true, seconds: /^\d+$/.test(value) ? Number(value) : null };
+    }
+    return { present: false, seconds: null };
+  };
+
+  const sMaxAge = parseAgeDirective("s-maxage");
+  const maxAge = parseAgeDirective("max-age");
+
+  let declaredMs: number;
+  if (sMaxAge.present) {
+    declaredMs = sMaxAge.seconds === null ? 0 : sMaxAge.seconds * 1000;
+  } else if (maxAge.present) {
+    declaredMs = maxAge.seconds === null ? 0 : maxAge.seconds * 1000;
+  } else {
+    const expiresHeader = res.headers.get?.("expires");
+    if (expiresHeader) {
+      const expiresAt = Date.parse(expiresHeader);
+      declaredMs = Number.isFinite(expiresAt) ? Math.max(0, expiresAt - now) : 0;
+    } else {
+      declaredMs = defaultWhenAbsentMs;
     }
   }
+
   const ageHeader = res.headers.get?.("age");
   const ageSeconds = ageHeader !== null && ageHeader !== undefined ? Number(ageHeader) : NaN;
   const ageMs = Number.isFinite(ageSeconds) && ageSeconds >= 0 ? ageSeconds * 1000 : 0;
-  const declaredMs = maxAgeSeconds === null ? maxStaleness : maxAgeSeconds * 1000;
   return Math.max(0, Math.min(declaredMs, maxStaleness) - ageMs);
 }
 
@@ -364,7 +442,10 @@ async function fetchList(
     return { outcome: "unknown", expiresAt: now + UNKNOWN_RETRY_MS };
   }
   if (res.status === 404) {
-    return { outcome: "not-found", expiresAt: now + freshnessMsFor(res, maxStaleness) };
+    // Capped below the 24h ceiling: a publisher's first list after a
+    // compromise must not go unseen for up to a day just because an
+    // earlier 404 was cached generously (spec §9.9/§13.4).
+    return { outcome: "not-found", expiresAt: now + freshnessMsFor(res, maxStaleness, NOT_FOUND_DEFAULT_MS, now) };
   }
   if (!res.ok) {
     return { outcome: "unknown", expiresAt: now + UNKNOWN_RETRY_MS };
@@ -372,7 +453,7 @@ async function fetchList(
 
   let parsed: unknown;
   try {
-    parsed = JSON.parse(await res.text());
+    parsed = parseRevocationDocumentStrict(await res.text());
   } catch {
     return { outcome: "unknown", expiresAt: now + UNKNOWN_RETRY_MS };
   }
@@ -418,9 +499,8 @@ async function fetchList(
   const signerHash = await spkiHash(resolved.publicKeyPem);
   const signerCanonical = canonicalKeyidForm(parsed.signer);
   const signerSelfListed = entries.some((entry) => {
-    const matchesByHash = entry.publicKeyHash !== undefined && entry.publicKeyHash === signerHash;
-    const matchesByKeyid = entry.publicKeyHash === undefined && canonicalKeyidForm(entry.keyid) === signerCanonical;
-    return matchesByHash || matchesByKeyid;
+    if (entry.status === "revoked") return entry.publicKeyHash === signerHash;
+    return entry.publicKeyHash ? entry.publicKeyHash === signerHash : canonicalKeyidForm(entry.keyid) === signerCanonical;
   });
   if (signerSelfListed) {
     return { outcome: "unknown", expiresAt: now + UNKNOWN_RETRY_MS };
@@ -443,7 +523,7 @@ async function fetchList(
     return { outcome: "unknown", expiresAt: now + UNKNOWN_RETRY_MS };
   }
 
-  return { outcome: "ok", expiresAt: now + freshnessMsFor(res, maxStaleness), entries };
+  return { outcome: "ok", expiresAt: now + freshnessMsFor(res, maxStaleness, maxStaleness, now), entries };
 }
 
 /**
@@ -460,16 +540,21 @@ export interface RevocationCheckKey {
  * decide whether and when to consult this, independent of the key
  * document's own `revoked` field.
  *
- * Takes the RESOLVED key, not just `keyid`, because the primary `revoked`
- * match is by key material (spec §9.7): `keyid` is opaque and signer-chosen,
- * and a match keyed only to its text is bypassable by resolving the same
- * key under a different, equally valid spelling of the same identifier.
+ * Takes the RESOLVED key, not just `keyid`, because the `revoked` match is
+ * by key material (spec §9.7): `keyid` is opaque and signer-chosen, and a
+ * match keyed only to its text is bypassable by resolving the same key
+ * under a different, equally valid spelling of the same identifier.
  *
  * Returns `undefined`, not a "revocation-unknown" result, when `keyid` has
  * no derivable HTTPS origin at all (a DID method other than did:web): no
  * fetch was attempted, so there is nothing to report. This matches the
  * W3C IDL's null-for-not-implemented convention for
  * `SignedSectionCryptoOutcome/revocationStatus`.
+ *
+ * This function alone closes keyid aliasing WITHIN the origin `keyid`
+ * itself names. It does not close a cross-host alias where a key document
+ * is reachable under a second hostname the verifier was never told is the
+ * same identity; see `../identifier-binding.js` and `verify.ts` for that.
  */
 export async function checkKeyRevocation(
   keyid: string,
@@ -496,21 +581,14 @@ export async function checkKeyRevocation(
   const resolvedHash = await spkiHash(resolvedKey.publicKeyPem);
   const canonicalChecked = canonicalKeyidForm(keyid);
 
-  // Primary match for "revoked": publicKeyHash against the resolved key's
-  // own SPKI hash. Immune to keyid aliasing by construction -- it never
-  // looks at which keyid string reached this key. Checked across every
-  // entry first, so a "revoked" entry always wins over any "superseded"
-  // entry for the same key, regardless of array order.
+  // "revoked": publicKeyHash against the resolved key's own SPKI hash,
+  // full stop. No keyid-text fallback -- a revoked entry without
+  // publicKeyHash is malformed (isRevocationEntry above) and the whole
+  // document was already rejected before reaching this point. Checked
+  // across every entry, so a "revoked" entry always wins over any
+  // "superseded" entry for the same key, regardless of array order.
   for (const entry of cached.entries) {
-    if (entry.status === "revoked" && entry.publicKeyHash && entry.publicKeyHash === resolvedHash) {
-      return { status: "revoked", superseded: false, revokedAt: entry.revokedAt };
-    }
-  }
-  // Secondary match for "revoked": canonical keyid form, only for an entry
-  // that omitted publicKeyHash. Never overrides a hash comparison that
-  // already ran and did not match (spec §9.7).
-  for (const entry of cached.entries) {
-    if (entry.status === "revoked" && !entry.publicKeyHash && canonicalKeyidForm(entry.keyid) === canonicalChecked) {
+    if (entry.status === "revoked" && entry.publicKeyHash === resolvedHash) {
       return { status: "revoked", superseded: false, revokedAt: entry.revokedAt };
     }
   }

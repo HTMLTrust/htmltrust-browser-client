@@ -167,12 +167,33 @@ function parseIPv4(host: string): number[] | null {
   return octets;
 }
 
+/**
+ * Extract the embedded IPv4 address from an IPv4-mapped IPv6 literal, in
+ * either the dotted-decimal form a hand-written literal might use
+ * (`::ffff:10.0.0.1`) or the hex-group form the URL Standard's own
+ * serializer always produces for `url.hostname` (`::ffff:a00:1`): WHATWG
+ * IPv6 serialization never preserves an embedded dotted-decimal form, so
+ * checking only the dotted form here would never actually match what
+ * `new URL(...).hostname` produces for a mapped address like
+ * `169.254.169.254` (cloud metadata), which serializes as `::ffff:a9fe:a9fe`.
+ */
+function ipv4FromMappedIPv6(host: string): number[] | null {
+  const dotted = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/.exec(host);
+  if (dotted) return parseIPv4(dotted[1]);
+  const hex = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(host);
+  if (!hex) return null;
+  const hi = parseInt(hex[1], 16);
+  const lo = parseInt(hex[2], 16);
+  if (hi > 0xffff || lo > 0xffff) return null;
+  return [(hi >> 8) & 0xff, hi & 0xff, (lo >> 8) & 0xff, lo & 0xff];
+}
+
 /** 127.0.0.0/8, ::1, and the `localhost` name reserved by RFC 6761. */
 export function isLoopbackHost(hostname: string): boolean {
   const host = unbracket(hostname).toLowerCase();
   if (host === "localhost" || host.endsWith(".localhost")) return true;
   if (host === "::1" || host === "0:0:0:0:0:0:0:1") return true;
-  const v4 = parseIPv4(host);
+  const v4 = parseIPv4(host) ?? ipv4FromMappedIPv6(host);
   return v4 !== null && v4[0] === 127;
 }
 
@@ -193,9 +214,8 @@ export function isPrivateHost(hostname: string): boolean {
   // IPv6 unique-local (fc00::/7) and link-local (fe80::/10).
   if (/^f[cd][0-9a-f]{2}:/.test(host)) return true;
   if (/^fe[89ab][0-9a-f]:/.test(host)) return true;
-  // IPv4-mapped IPv6, e.g. ::ffff:10.0.0.1
-  const mapped = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/.exec(host);
-  const v4 = parseIPv4(mapped ? mapped[1] : host);
+  // IPv4-mapped IPv6, either literal form -- see ipv4FromMappedIPv6.
+  const v4 = parseIPv4(host) ?? ipv4FromMappedIPv6(host);
   if (!v4) return false;
   const [a, b] = v4;
   if (a === 0 || a === 10 || a === 127) return true;
