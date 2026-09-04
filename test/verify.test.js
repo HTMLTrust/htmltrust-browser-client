@@ -386,6 +386,41 @@ test("isLoopbackHost: catches the hex-group IPv4-mapped IPv6 loopback form too",
   assert.equal(isLoopbackHost("[::ffff:a00:1]"), false, "10.0.0.1 is private but not loopback");
 });
 
+test("isPrivateHost: the IPv6 unspecified address", () => {
+  assert.equal(isPrivateHost("[::]"), true);
+  assert.equal(isPrivateHost("0:0:0:0:0:0:0:0"), true);
+});
+
+test("isPrivateHost: a trailing-dot FQDN is caught the same as its bare form", () => {
+  assert.equal(new URL("http://localhost./x").hostname, "localhost.", "sanity: URL parsing preserves the trailing dot");
+  assert.equal(isPrivateHost("localhost."), true);
+  assert.equal(isLoopbackHost("localhost."), true);
+});
+
+test("isPrivateHost: NAT64 (RFC 6052) literals embedding a private IPv4 address", () => {
+  assert.equal(new URL("http://[64:ff9b::a9fe:a9fe]/x").hostname, "[64:ff9b::a9fe:a9fe]", "sanity: this is what the URL Standard actually serializes");
+  assert.equal(isPrivateHost("[64:ff9b::a9fe:a9fe]"), true, "embeds 169.254.169.254, cloud metadata");
+  assert.equal(isPrivateHost("[64:ff9b::808:808]"), false, "embeds 8.8.8.8, a public address");
+});
+
+test("isPrivateHost: 100.64.0.0/10 (carrier-grade NAT, RFC 6598)", () => {
+  assert.equal(isPrivateHost("100.64.0.1"), true);
+  assert.equal(isPrivateHost("100.127.255.255"), true);
+  assert.equal(isPrivateHost("100.63.255.255"), false, "just below the range");
+  assert.equal(isPrivateHost("100.128.0.0"), false, "just above the range");
+});
+
+test("isPrivateHost: 168.63.129.16 (Azure platform metadata/DNS)", () => {
+  assert.equal(isPrivateHost("168.63.129.16"), true);
+  assert.equal(isPrivateHost("168.63.129.17"), false, "a single host, not a range");
+});
+
+test("isPrivateHost: 192.0.0.0/24 (IETF Protocol Assignments)", () => {
+  assert.equal(isPrivateHost("192.0.0.1"), true);
+  assert.equal(isPrivateHost("192.0.0.255"), true);
+  assert.equal(isPrivateHost("192.0.1.0"), false, "just outside the /24");
+});
+
 test("trustDirectoryResolver: refuses a private-network directory base URL", () => {
   assert.throws(
     () => trustDirectoryResolver({ baseUrls: ["https://10.0.0.5/directory"] }),

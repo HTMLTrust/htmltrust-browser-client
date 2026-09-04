@@ -154,6 +154,17 @@ function unbracket(hostname: string): string {
     : hostname;
 }
 
+/**
+ * A trailing-dot FQDN (`localhost.`, the DNS root-relative form) is
+ * preserved verbatim by URL parsing rather than normalized away, so
+ * `"localhost."` and `"localhost"` are different strings by the time they
+ * reach here even though they name the identical host. Strip at most one
+ * trailing dot before matching so both spellings are caught alike.
+ */
+function stripTrailingDot(host: string): string {
+  return host.endsWith(".") ? host.slice(0, -1) : host;
+}
+
 function parseIPv4(host: string): number[] | null {
   const parts = host.split(".");
   if (parts.length !== 4) return null;
@@ -188,12 +199,28 @@ function ipv4FromMappedIPv6(host: string): number[] | null {
   return [(hi >> 8) & 0xff, hi & 0xff, (lo >> 8) & 0xff, lo & 0xff];
 }
 
+/**
+ * Extract the embedded IPv4 address from a NAT64 (RFC 6052) literal in the
+ * `64:ff9b::/96` well-known prefix, in the compressed hex-group form the
+ * URL Standard's serializer produces (`64:ff9b::a9fe:a9fe`). A NAT64
+ * gateway routes this straight to the embedded IPv4 destination, so it
+ * needs the same private-range check as any other IPv4-embedding form.
+ */
+function ipv4FromNat64(host: string): number[] | null {
+  const hex = /^64:ff9b::([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(host);
+  if (!hex) return null;
+  const hi = parseInt(hex[1], 16);
+  const lo = parseInt(hex[2], 16);
+  if (hi > 0xffff || lo > 0xffff) return null;
+  return [(hi >> 8) & 0xff, hi & 0xff, (lo >> 8) & 0xff, lo & 0xff];
+}
+
 /** 127.0.0.0/8, ::1, and the `localhost` name reserved by RFC 6761. */
 export function isLoopbackHost(hostname: string): boolean {
-  const host = unbracket(hostname).toLowerCase();
+  const host = stripTrailingDot(unbracket(hostname).toLowerCase());
   if (host === "localhost" || host.endsWith(".localhost")) return true;
   if (host === "::1" || host === "0:0:0:0:0:0:0:1") return true;
-  const v4 = parseIPv4(host) ?? ipv4FromMappedIPv6(host);
+  const v4 = parseIPv4(host) ?? ipv4FromMappedIPv6(host) ?? ipv4FromNat64(host);
   return v4 !== null && v4[0] === 127;
 }
 
@@ -209,19 +236,26 @@ export function isLoopbackHost(hostname: string): boolean {
  * do control resolution should apply the same rules post-resolution.
  */
 export function isPrivateHost(hostname: string): boolean {
-  const host = unbracket(hostname).toLowerCase();
+  const host = stripTrailingDot(unbracket(hostname).toLowerCase());
   if (isLoopbackHost(host)) return true;
+  // IPv6 unspecified address: not a routable destination, but not a
+  // safe one to hand to a fetch implementation either.
+  if (host === "::" || host === "0:0:0:0:0:0:0:0") return true;
   // IPv6 unique-local (fc00::/7) and link-local (fe80::/10).
   if (/^f[cd][0-9a-f]{2}:/.test(host)) return true;
   if (/^fe[89ab][0-9a-f]:/.test(host)) return true;
-  // IPv4-mapped IPv6, either literal form -- see ipv4FromMappedIPv6.
-  const v4 = parseIPv4(host) ?? ipv4FromMappedIPv6(host);
+  // IPv4-mapped IPv6 and NAT64 (RFC 6052), either literal form -- see
+  // ipv4FromMappedIPv6 and ipv4FromNat64.
+  const v4 = parseIPv4(host) ?? ipv4FromMappedIPv6(host) ?? ipv4FromNat64(host);
   if (!v4) return false;
-  const [a, b] = v4;
+  const [a, b, c, d] = v4;
   if (a === 0 || a === 10 || a === 127) return true;
   if (a === 169 && b === 254) return true; // link-local, incl. cloud metadata
   if (a === 172 && b >= 16 && b <= 31) return true;
   if (a === 192 && b === 168) return true;
+  if (a === 100 && b >= 64 && b <= 127) return true; // RFC 6598 carrier-grade NAT
+  if (a === 168 && b === 63 && c === 129 && d === 16) return true; // Azure platform metadata/DNS
+  if (a === 192 && b === 0 && c === 0) return true; // RFC 6890 IETF Protocol Assignments (incl. NAT64/DNS64 discovery, AMT)
   return false;
 }
 

@@ -12,7 +12,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
   checkKeyRevocation,
   createRevocationCache,
@@ -25,8 +25,14 @@ import {
   NOT_FOUND_DEFAULT_MS,
   UNKNOWN_RETRY_MS,
   directUrlResolver,
+  didWebResolver,
+  resolveKey,
   verifySignedSection,
   canonicalizeSignedContent,
+  checkKeyIdentifierBinding,
+  createIdentifierBindingCache,
+  DEFAULT_BINDING_CACHE_MS,
+  DEFAULT_NEGATIVE_BINDING_CACHE_MS,
 } from "../dist/index.js";
 import { canonicalizeJson, buildSigningPayloadV1, canonicalizeClaims } from "@htmltrust/canonicalization";
 import { generateKey, sha256Hex, sha256HexAsync, signEd25519, startServer, stopServer } from "./_helpers.js";
@@ -170,7 +176,7 @@ test("checkKeyRevocation: matches a revoked entry by publicKeyHash, not by keyid
   const targetHash = nodeSpkiHash(targetPublicKey);
   let doc;
   const { server, base } = await startServer({
-    "/signer.json": () => ({ body: { publicKey: pem, algorithm: "ed25519" } }),
+    "/signer.json": () => ({ body: { publicKey: pem, algorithm: "ed25519", kid: `${base}/signer.json` } }),
     "/.well-known/htmltrust-revocations.json": () => ({ body: doc }),
   });
   try {
@@ -206,7 +212,7 @@ test("checkKeyRevocation: KEYID-ALIAS REGRESSION -- a differently-spelled keyid 
   const targetHash = nodeSpkiHash(targetPublicKey);
   let doc;
   const { server, base } = await startServer({
-    "/signer.json": () => ({ body: { publicKey: pem, algorithm: "ed25519" } }),
+    "/signer.json": () => ({ body: { publicKey: pem, algorithm: "ed25519", kid: `${base}/signer.json` } }),
     "/.well-known/htmltrust-revocations.json": () => ({ body: doc }),
   });
   try {
@@ -241,7 +247,7 @@ test("checkKeyRevocation: a publicKeyHash mismatch does not fall back to a false
   const { publicKey: unrelatedPublicKey } = generateKey();
   let doc;
   const { server, base } = await startServer({
-    "/signer.json": () => ({ body: { publicKey: pem, algorithm: "ed25519" } }),
+    "/signer.json": () => ({ body: { publicKey: pem, algorithm: "ed25519", kid: `${base}/signer.json` } }),
     "/.well-known/htmltrust-revocations.json": () => ({ body: doc }),
   });
   try {
@@ -278,7 +284,7 @@ test("checkKeyRevocation: a revoked entry omitting publicKeyHash is malformed an
   const { pem: targetPem } = generateKey();
   let doc;
   const { server, base } = await startServer({
-    "/signer.json": () => ({ body: { publicKey: pem, algorithm: "ed25519" } }),
+    "/signer.json": () => ({ body: { publicKey: pem, algorithm: "ed25519", kid: `${base}/signer.json` } }),
     "/.well-known/htmltrust-revocations.json": () => ({ body: doc }),
   });
   try {
@@ -309,7 +315,7 @@ test("checkKeyRevocation: an entry naming a different keyid (and different key m
   const { publicKey: unrelatedPublicKey } = generateKey();
   let doc;
   const { server, base } = await startServer({
-    "/signer.json": () => ({ body: { publicKey: pem, algorithm: "ed25519" } }),
+    "/signer.json": () => ({ body: { publicKey: pem, algorithm: "ed25519", kid: `${base}/signer.json` } }),
     "/.well-known/htmltrust-revocations.json": () => ({ body: doc }),
   });
   try {
@@ -338,7 +344,7 @@ test("checkKeyRevocation: superseded entry matched by canonical keyid is not-rev
   const { pem: targetPem } = generateKey();
   let doc;
   const { server, base } = await startServer({
-    "/signer.json": () => ({ body: { publicKey: pem, algorithm: "ed25519" } }),
+    "/signer.json": () => ({ body: { publicKey: pem, algorithm: "ed25519", kid: `${base}/signer.json` } }),
     "/.well-known/htmltrust-revocations.json": () => ({ body: doc }),
   });
   try {
@@ -374,7 +380,7 @@ test("checkKeyRevocation: superseded entry matched by publicKeyHash when present
   const targetHash = nodeSpkiHash(targetPublicKey);
   let doc;
   const { server, base } = await startServer({
-    "/signer.json": () => ({ body: { publicKey: pem, algorithm: "ed25519" } }),
+    "/signer.json": () => ({ body: { publicKey: pem, algorithm: "ed25519", kid: `${base}/signer.json` } }),
     "/.well-known/htmltrust-revocations.json": () => ({ body: doc }),
   });
   try {
@@ -406,7 +412,7 @@ test("checkKeyRevocation: key absent from an otherwise-valid list is not-revoked
   const { pem: targetPem } = generateKey();
   let doc;
   const { server, base } = await startServer({
-    "/signer.json": () => ({ body: { publicKey: pem, algorithm: "ed25519" } }),
+    "/signer.json": () => ({ body: { publicKey: pem, algorithm: "ed25519", kid: `${base}/signer.json` } }),
     "/.well-known/htmltrust-revocations.json": () => ({ body: doc }),
   });
   try {
@@ -431,7 +437,7 @@ test("checkKeyRevocation: invalid signature is revocation-unknown", async () => 
   const { pem: targetPem } = generateKey();
   let doc;
   const { server, base } = await startServer({
-    "/signer.json": () => ({ body: { publicKey: pem, algorithm: "ed25519" } }),
+    "/signer.json": () => ({ body: { publicKey: pem, algorithm: "ed25519", kid: `${base}/signer.json` } }),
     "/.well-known/htmltrust-revocations.json": () => ({ body: doc }),
   });
   try {
@@ -511,7 +517,7 @@ test("checkKeyRevocation: a list signed by an already-revoked signer key is revo
   let doc;
   const { server, base } = await startServer({
     // The signer's own key document says it is revoked.
-    "/signer.json": () => ({ body: { publicKey: pem, algorithm: "ed25519", revoked: true } }),
+    "/signer.json": () => ({ body: { publicKey: pem, algorithm: "ed25519", revoked: true, kid: `${base}/signer.json` } }),
     "/.well-known/htmltrust-revocations.json": () => ({ body: doc }),
   });
   try {
@@ -938,7 +944,7 @@ test("checkKeyRevocation: a same-origin signer (the ordinary case) is accepted",
   const { pem: targetPem, publicKey: targetPublicKey } = generateKey();
   let doc;
   const { server, base } = await startServer({
-    "/signer.json": () => ({ body: { publicKey: pem, algorithm: "ed25519" } }),
+    "/signer.json": () => ({ body: { publicKey: pem, algorithm: "ed25519", kid: `${base}/signer.json` } }),
     "/.well-known/htmltrust-revocations.json": () => ({ body: doc }),
   });
   try {
@@ -1053,7 +1059,7 @@ test("checkKeyRevocation: a revoked entry wins over a superseded entry for the s
   const targetHash = nodeSpkiHash(targetPublicKey);
   let doc;
   const { server, base } = await startServer({
-    "/signer.json": () => ({ body: { publicKey: pem, algorithm: "ed25519" } }),
+    "/signer.json": () => ({ body: { publicKey: pem, algorithm: "ed25519", kid: `${base}/signer.json` } }),
     "/.well-known/htmltrust-revocations.json": () => ({ body: doc }),
   });
   try {
@@ -1089,7 +1095,7 @@ test("checkKeyRevocation: a signer listed revoked within its own list (list cont
   let doc;
   const { server, base } = await startServer({
     // The signer's own key document is fine -- not revoked.
-    "/signer.json": () => ({ body: { publicKey: pem, algorithm: "ed25519" } }),
+    "/signer.json": () => ({ body: { publicKey: pem, algorithm: "ed25519", kid: `${base}/signer.json` } }),
     "/.well-known/htmltrust-revocations.json": () => ({ body: doc }),
   });
   try {
@@ -1119,7 +1125,7 @@ test("checkKeyRevocation: a signer listed superseded within its own list is reje
   const { privateKey, pem } = generateKey();
   let doc;
   const { server, base } = await startServer({
-    "/signer.json": () => ({ body: { publicKey: pem, algorithm: "ed25519" } }),
+    "/signer.json": () => ({ body: { publicKey: pem, algorithm: "ed25519", kid: `${base}/signer.json` } }),
     "/.well-known/htmltrust-revocations.json": () => ({ body: doc }),
   });
   try {
@@ -1148,7 +1154,7 @@ test("checkKeyRevocation: a malformed entry anywhere in the document invalidates
   const { pem: targetPem } = generateKey();
   let doc;
   const { server, base } = await startServer({
-    "/signer.json": () => ({ body: { publicKey: pem, algorithm: "ed25519" } }),
+    "/signer.json": () => ({ body: { publicKey: pem, algorithm: "ed25519", kid: `${base}/signer.json` } }),
     "/.well-known/htmltrust-revocations.json": () => ({ body: doc }),
   });
   try {
@@ -1187,7 +1193,7 @@ test("checkKeyRevocation: an entry with an unrecognized extra field is NOT malfo
   const targetHash = nodeSpkiHash(targetPublicKey);
   let doc;
   const { server, base } = await startServer({
-    "/signer.json": () => ({ body: { publicKey: pem, algorithm: "ed25519" } }),
+    "/signer.json": () => ({ body: { publicKey: pem, algorithm: "ed25519", kid: `${base}/signer.json` } }),
     "/.well-known/htmltrust-revocations.json": () => ({ body: doc }),
   });
   try {
@@ -1289,7 +1295,7 @@ test("checkKeyRevocation: a document with a duplicate top-level JSON member is r
   const { privateKey, pem } = generateKey();
   let rawBody;
   const { server, base } = await startServer({
-    "/signer.json": () => ({ body: { publicKey: pem, algorithm: "ed25519" } }),
+    "/signer.json": () => ({ body: { publicKey: pem, algorithm: "ed25519", kid: `${base}/signer.json` } }),
     "/.well-known/htmltrust-revocations.json": () => ({ body: rawBody, headers: { "content-type": "application/json" } }),
   });
   try {
@@ -1505,6 +1511,371 @@ test("verifySignedSection: fullyVerified is false (not true) when revocationStat
     assert.equal(result.valid, true, result.reason);
     assert.equal(result.revocationStatus, "revocation-unknown");
     assert.equal(result.fullyVerified, false, "revocation-unknown must not read as fully verified even though valid is true");
+  } finally {
+    await stopServer(server);
+  }
+});
+
+// === C1: 404 caching cap applies even when the server DOES supply a longer max-age ===
+
+test("checkKeyRevocation: C1 -- a 404 with max-age=86400 is still capped at 1h, so a list published shortly after is seen well within 24h", async () => {
+  const { privateKey, pem } = generateKey();
+  const { pem: targetPem, publicKey: targetPublicKey } = generateKey();
+  const targetHash = nodeSpkiHash(targetPublicKey);
+  let published = false;
+  let doc;
+  const { server, base } = await startServer({
+    "/signer.json": () => ({ body: { publicKey: pem, algorithm: "ed25519", kid: `${base}/signer.json` } }),
+    "/.well-known/htmltrust-revocations.json": () => {
+      if (!published) return { status: 404, body: "", headers: { "cache-control": "max-age=86400" } };
+      return { body: doc };
+    },
+  });
+  try {
+    const signerKeyid = `${base}/signer.json`;
+    const targetKeyid = `${base}/alice.json`;
+    doc = signRevocationDoc(
+      {
+        signer: signerKeyid,
+        algorithm: "ed25519",
+        timestamp: "2026-06-01T00:00:00Z",
+        revocations: [{ keyid: targetKeyid, status: "revoked", publicKeyHash: targetHash }],
+      },
+      privateKey,
+    );
+    const cache = createRevocationCache();
+    let now = 1_000_000;
+    const opts = { keyResolvers: resolvers(), allowInsecureHttpForTesting: true, cache, now: () => now };
+    // t0: 404 with a 24h max-age is cached.
+    const r1 = await checkKeyRevocation(targetKeyid, { publicKeyPem: targetPem }, opts);
+    assert.equal(r1.status, "not-revoked");
+    // t0+1s: the publisher publishes the list.
+    published = true;
+    // t0+3601s: past the 1h cap, but nowhere near the declared 24h max-age.
+    now += 3601 * 1000;
+    const r2 = await checkKeyRevocation(targetKeyid, { publicKeyPem: targetPem }, opts);
+    assert.equal(
+      r2.status,
+      "revoked",
+      "a 404's max-age must not hide a newly published list for anywhere near as long as it claims",
+    );
+  } finally {
+    await stopServer(server);
+  }
+});
+
+// === C2: a bare "max-age" directive (no "=") is malformed, treated as 0 ===
+
+test("checkKeyRevocation: C2 -- a bare max-age directive with no value is malformed, treated as 0, not as absent", async () => {
+  let fetchCount = 0;
+  const { server, base } = await startServer({
+    "/.well-known/htmltrust-revocations.json": () => {
+      fetchCount += 1;
+      return { status: 404, body: "", headers: { "cache-control": "max-age" } };
+    },
+  });
+  try {
+    const cache = createRevocationCache();
+    const opts = { keyResolvers: [], allowInsecureHttpForTesting: true, cache };
+    await checkKeyRevocation(`${base}/alice.json`, { publicKeyPem: "unused" }, opts);
+    await checkKeyRevocation(`${base}/alice.json`, { publicKeyPem: "unused" }, opts);
+    assert.equal(fetchCount, 2, "a bare max-age must revalidate immediately (0), not fall back to any default");
+  } finally {
+    await stopServer(server);
+  }
+});
+
+// === C3: publicKeyHash must decode to exactly 32 bytes ===
+
+function toUnpaddedBase64(buf) {
+  return buf.toString("base64").replace(/=+$/, "");
+}
+
+test("checkKeyRevocation: C3 -- a publicKeyHash decoding to 48 bytes (e.g. a mistakenly-supplied SHA-384) is malformed", async () => {
+  const { privateKey, pem } = generateKey();
+  let doc;
+  const { server, base } = await startServer({
+    "/signer.json": () => ({ body: { publicKey: pem, algorithm: "ed25519", kid: `${base}/signer.json` } }),
+    "/.well-known/htmltrust-revocations.json": () => ({ body: doc }),
+  });
+  try {
+    const signerKeyid = `${base}/signer.json`;
+    const targetKeyid = `${base}/alice.json`;
+    const wrongLengthHash = toUnpaddedBase64(createHash("sha384").update("x").digest());
+    doc = signRevocationDoc(
+      {
+        signer: signerKeyid,
+        algorithm: "ed25519",
+        timestamp: "2026-06-01T00:00:00Z",
+        revocations: [{ keyid: targetKeyid, status: "revoked", publicKeyHash: wrongLengthHash }],
+      },
+      privateKey,
+    );
+    const result = await checkKeyRevocation(targetKeyid, { publicKeyPem: "unused" }, {
+      keyResolvers: resolvers(),
+      allowInsecureHttpForTesting: true,
+    });
+    assert.equal(result.status, "revocation-unknown");
+  } finally {
+    await stopServer(server);
+  }
+});
+
+test("checkKeyRevocation: C3 -- a publicKeyHash decoding to 31 bytes is malformed", async () => {
+  const { privateKey, pem } = generateKey();
+  let doc;
+  const { server, base } = await startServer({
+    "/signer.json": () => ({ body: { publicKey: pem, algorithm: "ed25519", kid: `${base}/signer.json` } }),
+    "/.well-known/htmltrust-revocations.json": () => ({ body: doc }),
+  });
+  try {
+    const signerKeyid = `${base}/signer.json`;
+    const targetKeyid = `${base}/alice.json`;
+    const wrongLengthHash = toUnpaddedBase64(randomBytes(31));
+    doc = signRevocationDoc(
+      {
+        signer: signerKeyid,
+        algorithm: "ed25519",
+        timestamp: "2026-06-01T00:00:00Z",
+        revocations: [{ keyid: targetKeyid, status: "revoked", publicKeyHash: wrongLengthHash }],
+      },
+      privateKey,
+    );
+    const result = await checkKeyRevocation(targetKeyid, { publicKeyPem: "unused" }, {
+      keyResolvers: resolvers(),
+      allowInsecureHttpForTesting: true,
+    });
+    assert.equal(result.status, "revocation-unknown");
+  } finally {
+    await stopServer(server);
+  }
+});
+
+// === C4: identifier binding applies to the list's SIGNER too ===
+
+test("checkKeyRevocation: C4 -- a list signer document with no kid is malformed, so the whole list is revocation-unknown", async () => {
+  const { privateKey, pem } = generateKey();
+  let doc;
+  const { server, base } = await startServer({
+    "/signer.json": () => ({ body: { publicKey: pem, algorithm: "ed25519" } }), // no kid
+    "/.well-known/htmltrust-revocations.json": () => ({ body: doc }),
+  });
+  try {
+    const signerKeyid = `${base}/signer.json`;
+    doc = signRevocationDoc(
+      { signer: signerKeyid, algorithm: "ed25519", timestamp: "2026-06-01T00:00:00Z", revocations: [] },
+      privateKey,
+    );
+    const result = await checkKeyRevocation(`${base}/alice.json`, { publicKeyPem: "unused" }, {
+      keyResolvers: resolvers(),
+      allowInsecureHttpForTesting: true,
+    });
+    assert.equal(result.status, "revocation-unknown");
+  } finally {
+    await stopServer(server);
+  }
+});
+
+test("checkKeyRevocation: C4 -- a list signer document with a mismatched kid is malformed, so the whole list is revocation-unknown", async () => {
+  const { privateKey, pem } = generateKey();
+  let doc;
+  const { server, base } = await startServer({
+    "/signer.json": () => ({ body: { publicKey: pem, algorithm: "ed25519", kid: `${base}/someone-else.json` } }),
+    "/.well-known/htmltrust-revocations.json": () => ({ body: doc }),
+  });
+  try {
+    const signerKeyid = `${base}/signer.json`;
+    doc = signRevocationDoc(
+      { signer: signerKeyid, algorithm: "ed25519", timestamp: "2026-06-01T00:00:00Z", revocations: [] },
+      privateKey,
+    );
+    const result = await checkKeyRevocation(`${base}/alice.json`, { publicKeyPem: "unused" }, {
+      keyResolvers: resolvers(),
+      allowInsecureHttpForTesting: true,
+    });
+    assert.equal(result.status, "revocation-unknown");
+  } finally {
+    await stopServer(server);
+  }
+});
+
+test("checkKeyRevocation: C4 -- a signer keyid that is a dot-segment alias of its own kid is malformed, so the list is revocation-unknown", async () => {
+  const { privateKey, pem } = generateKey();
+  let doc;
+  const { server, base } = await startServer({
+    "/signer.json": () => ({ body: { publicKey: pem, algorithm: "ed25519", kid: `${base}/signer.json` } }),
+    "/.well-known/htmltrust-revocations.json": () => ({ body: doc }),
+  });
+  try {
+    // The signer keyid used in the list is an alias of the canonical kid.
+    const signerKeyid = `${base}/./signer.json`;
+    doc = signRevocationDoc(
+      { signer: signerKeyid, algorithm: "ed25519", timestamp: "2026-06-01T00:00:00Z", revocations: [] },
+      privateKey,
+    );
+    const result = await checkKeyRevocation(`${base}/alice.json`, { publicKeyPem: "unused" }, {
+      keyResolvers: resolvers(),
+      allowInsecureHttpForTesting: true,
+    });
+    assert.equal(result.status, "revocation-unknown");
+  } finally {
+    await stopServer(server);
+  }
+});
+
+// === C5: identifier binding must not force-fail a keyid form it doesn't gate (did:key etc.) ===
+
+test("verifySignedSection: C5 -- a did:key keyid (no derivable revocation-list origin) verifies identically with checkRevocationList on or off", async () => {
+  const { privateKey, pem } = generateKey();
+  const domain = "https://example.org";
+  const keyid = "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK";
+  const { html } = await buildSigned({
+    privateKey,
+    body: "<p>Body.</p>",
+    claims: { author: "Alice" },
+    signedAt: "2026-04-28T12:00:00Z",
+    domain,
+    keyid,
+  });
+  const stubResolver = {
+    resolve: async (candidate) => (candidate === keyid ? { keyid, publicKeyPem: pem, algorithm: "ed25519" } : null),
+  };
+  const withoutOption = await verifySignedSection(html, { keyResolvers: [stubResolver], domain, hash: sha256HexAsync });
+  const withOption = await verifySignedSection(html, {
+    keyResolvers: [stubResolver],
+    domain,
+    hash: sha256HexAsync,
+    checkRevocationList: true,
+  });
+  assert.equal(withoutOption.valid, true, withoutOption.reason);
+  assert.equal(withOption.valid, true, withOption.reason);
+  assert.equal(withoutOption.revocationStatus, undefined);
+  assert.equal(withOption.revocationStatus, undefined, "did:key has no derivable revocation-list origin; identifier binding must not force-fail it");
+  assert.equal(withoutOption.fullyVerified, undefined);
+  assert.equal(withOption.fullyVerified, undefined);
+});
+
+// === C6: identifier-binding.ts's did:web URL construction matches the canonicalization resolver's own ===
+
+test("checkKeyIdentifierBinding: C6 -- did:web URL construction for a percent-encoded path segment matches the canonicalization resolver's own", async () => {
+  const keyid = "did:web:example.com%3A8443:%62";
+  let resolverUrl;
+  const resolverFetch = async (url) => {
+    resolverUrl = url.toString();
+    throw new Error("stop before a real network call");
+  };
+  try {
+    await resolveKey(keyid, [didWebResolver({ fetch: resolverFetch })]);
+  } catch {
+    // expected: the mock fetch always throws
+  }
+  let bindingUrl;
+  const bindingFetch = async (url) => {
+    bindingUrl = url.toString();
+    throw new Error("stop before a real network call");
+  };
+  await checkKeyIdentifierBinding(keyid, { fetch: bindingFetch, cache: createIdentifierBindingCache() });
+  assert.ok(resolverUrl, "the resolver must have attempted a fetch");
+  assert.ok(bindingUrl, "the binding check must have attempted a fetch");
+  assert.equal(bindingUrl, resolverUrl, "both modules must construct the identical DID document URL");
+  assert.equal(resolverUrl, "https://example.com:8443/%62/did.json", "must not double-encode the already-percent-encoded path segment");
+});
+
+// === C8: binding cache TTLs and cache-option threading ===
+
+test("checkKeyIdentifierBinding: C8 -- caches a negative (failure) result for less time than a positive one", async () => {
+  let fetchCount = 0;
+  const { server, base } = await startServer({
+    "/key.json": () => {
+      fetchCount += 1;
+      return { body: { publicKey: "unused", algorithm: "ed25519" } }; // no kid -> failure
+    },
+  });
+  try {
+    const cache = createIdentifierBindingCache();
+    let now = 1_000_000;
+    const opts = { allowInsecureHttpForTesting: true, cache, now: () => now };
+    await checkKeyIdentifierBinding(`${base}/key.json`, opts);
+    now += DEFAULT_NEGATIVE_BINDING_CACHE_MS - 1;
+    await checkKeyIdentifierBinding(`${base}/key.json`, opts);
+    assert.equal(fetchCount, 1, "still within the negative-result window");
+    now += 2;
+    await checkKeyIdentifierBinding(`${base}/key.json`, opts);
+    assert.equal(fetchCount, 2, "past the negative window, must re-check");
+  } finally {
+    await stopServer(server);
+  }
+});
+
+test("checkKeyIdentifierBinding: DEFAULT_NEGATIVE_BINDING_CACHE_MS is 5 minutes, shorter than DEFAULT_BINDING_CACHE_MS (1h)", () => {
+  assert.equal(DEFAULT_NEGATIVE_BINDING_CACHE_MS, 5 * 60 * 1000);
+  assert.equal(DEFAULT_BINDING_CACHE_MS, 60 * 60 * 1000);
+  assert.ok(DEFAULT_NEGATIVE_BINDING_CACHE_MS < DEFAULT_BINDING_CACHE_MS);
+});
+
+test("checkKeyRevocation: C8 -- options.bindingCache is threaded through to the signer's identifier-binding check", async () => {
+  const { privateKey, pem } = generateKey();
+  let doc;
+  const { server, base } = await startServer({
+    "/signer.json": () => ({ body: { publicKey: pem, algorithm: "ed25519", kid: `${base}/signer.json` } }),
+    "/.well-known/htmltrust-revocations.json": () => ({ body: doc }),
+  });
+  try {
+    const signerKeyid = `${base}/signer.json`;
+    doc = signRevocationDoc(
+      { signer: signerKeyid, algorithm: "ed25519", timestamp: "2026-06-01T00:00:00Z", revocations: [] },
+      privateKey,
+    );
+    const bindingCache = createIdentifierBindingCache();
+    // Pre-seed a cached FAILURE for the signer's own binding check, as if
+    // an earlier check already ran and failed. This proves
+    // options.bindingCache is actually read here, not silently ignored --
+    // the signer document itself is perfectly valid, so only a threaded,
+    // honored bindingCache explains a revocation-unknown result below.
+    bindingCache.set(signerKeyid, {
+      result: { ok: false, reason: "malformed-key-document" },
+      expiresAt: Date.now() + 60_000,
+    });
+    const result = await checkKeyRevocation(`${base}/alice.json`, { publicKeyPem: "unused" }, {
+      keyResolvers: resolvers(),
+      allowInsecureHttpForTesting: true,
+      bindingCache,
+    });
+    assert.equal(result.status, "revocation-unknown");
+  } finally {
+    await stopServer(server);
+  }
+});
+
+// === C9: revocationStatus carried forward on a later, unrelated failure ===
+
+test("verifySignedSection: C9 -- revocationStatus is carried forward on a later signature-invalid failure, when the list was consulted", async () => {
+  const { privateKey, pem } = generateKey();
+  const { privateKey: wrongPrivateKey } = generateKey();
+  const { server, base } = await startServer({
+    "/key.json": () => ({ body: { publicKey: pem, algorithm: "ed25519", kid: `${base}/key.json` } }),
+  });
+  try {
+    const keyid = `${base}/key.json`;
+    const domain = "https://example.org";
+    const { html } = await buildSigned({
+      privateKey: wrongPrivateKey, // signed with the WRONG key, so the signature will not verify against `pem`
+      body: "<p>Body.</p>",
+      claims: { author: "Alice" },
+      signedAt: "2026-04-28T12:00:00Z",
+      domain,
+      keyid,
+    });
+    const result = await verifySignedSection(html, {
+      keyResolvers: [directUrlResolver({ allowInsecureHttpForTesting: true })],
+      domain,
+      hash: sha256HexAsync,
+      checkRevocationList: true,
+      revocationOptions: { allowInsecureHttpForTesting: true },
+    });
+    assert.equal(result.valid, false);
+    assert.equal(result.reason, "signature-invalid");
+    assert.equal(result.revocationStatus, "not-revoked", "the revocation check already ran before signature verification and its result must be carried forward");
   } finally {
     await stopServer(server);
   }

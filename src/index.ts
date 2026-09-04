@@ -85,6 +85,7 @@ export {
   checkKeyIdentifierBinding,
   createIdentifierBindingCache,
   DEFAULT_BINDING_CACHE_MS,
+  DEFAULT_NEGATIVE_BINDING_CACHE_MS,
 } from "./identifier-binding.js";
 export type {
   IdentifierBindingCache,

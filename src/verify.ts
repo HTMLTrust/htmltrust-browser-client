@@ -33,7 +33,7 @@ import type {
   VerificationFailureReason,
   VerificationInputState,
 } from "./spec.js";
-import { checkKeyRevocation, keyidHasForbiddenUrlSyntax, keyidHasUnsupportedScheme } from "./revocation.js";
+import { checkKeyRevocation, keyidHasForbiddenUrlSyntax, keyidHasUnsupportedScheme, revocationListOrigin } from "./revocation.js";
 import type { RevocationCheckOptions, RevocationStatus } from "./revocation.js";
 import { checkKeyIdentifierBinding } from "./identifier-binding.js";
 
@@ -861,16 +861,27 @@ export async function verifySignedSection(
     // checkRevocationList there is no revocation check for an alias to
     // evade, so paying for the extra fetch only when it buys something is
     // the right tradeoff, matching this feature's existing opt-in design.
-    const binding = await checkKeyIdentifierBinding(keyid, {
-      fetch: options.revocationOptions?.fetch,
-      allowInsecureHttpForTesting: options.revocationOptions?.allowInsecureHttpForTesting,
-      sameOriginSourceRefetch: options.revocationOptions?.sameOriginSourceRefetch,
-      origin: options.revocationOptions?.origin,
-      now: options.revocationOptions?.now,
-    });
-    if (!binding.ok) {
-      warn(binding.reason, { keyid, reason: "key-identifier-binding-failed" });
-      return empty(binding.reason, { claimsHash });
+    //
+    // Gated on `keyid` actually having a derivable revocation-list origin:
+    // a did:key (or any other non-did:web, non-https) keyid a configured
+    // resolver understands has none, and MUST NOT be rejected by this
+    // check -- checkKeyRevocation already reports that case as "no list
+    // applies" (undefined, not revocation-unknown), and binding must agree
+    // rather than force-failing verification for a keyid form it was never
+    // meant to gate.
+    if (revocationListOrigin(keyid) !== null) {
+      const binding = await checkKeyIdentifierBinding(keyid, {
+        fetch: options.revocationOptions?.fetch,
+        allowInsecureHttpForTesting: options.revocationOptions?.allowInsecureHttpForTesting,
+        sameOriginSourceRefetch: options.revocationOptions?.sameOriginSourceRefetch,
+        origin: options.revocationOptions?.origin,
+        now: options.revocationOptions?.now,
+        cache: options.revocationOptions?.bindingCache,
+      });
+      if (!binding.ok) {
+        warn(binding.reason, { keyid, reason: "key-identifier-binding-failed" });
+        return empty(binding.reason, { claimsHash });
+      }
     }
 
     const revocation = await checkKeyRevocation(keyid, resolved, {
@@ -891,7 +902,15 @@ export async function verifySignedSection(
   const resolvedAlgorithm = resolved.algorithm || "";
   if (resolvedAlgorithm !== algorithm) {
     warn("algorithm-mismatch", { resolvedAlgorithm, algorithm });
-    return empty("algorithm-mismatch", { claimsHash, algorithm: resolvedAlgorithm });
+    return empty("algorithm-mismatch", {
+      claimsHash,
+      algorithm: resolvedAlgorithm,
+      // Trivial to carry forward: the revocation check above (when it ran)
+      // already computed these before this later, unrelated failure.
+      ...(revocationStatus !== undefined ? { revocationStatus } : {}),
+      ...(keySuperseded !== undefined ? { keySuperseded } : {}),
+      ...(supersededBy !== undefined ? { supersededBy } : {}),
+    });
   }
 
   if (algorithm.startsWith("rsa-")) {
@@ -922,6 +941,9 @@ export async function verifySignedSection(
     return empty("signature-invalid", {
       claimsHash,
       algorithm,
+      ...(revocationStatus !== undefined ? { revocationStatus } : {}),
+      ...(keySuperseded !== undefined ? { keySuperseded } : {}),
+      ...(supersededBy !== undefined ? { supersededBy } : {}),
     });
   }
 

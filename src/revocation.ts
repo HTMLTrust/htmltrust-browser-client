@@ -80,8 +80,10 @@
 
 import { canonicalizeJson, canonicalizeJsonDocument, isKeyRevoked, resolveKey, verifySignature } from "@htmltrust/canonicalization";
 import type { KeyResolver } from "@htmltrust/canonicalization";
-import { bytesToUnpaddedBase64, isCanonicalBase64, makeVerificationFetch } from "./spec.js";
+import { bytesToUnpaddedBase64, decodeCanonicalBase64, isCanonicalBase64, makeVerificationFetch } from "./spec.js";
 import type { VerificationFetchOptions } from "./spec.js";
+import { checkKeyIdentifierBinding } from "./identifier-binding.js";
+import type { IdentifierBindingCache } from "./identifier-binding.js";
 
 export type RevocationStatus = "not-revoked" | "revoked" | "revocation-unknown";
 
@@ -167,6 +169,8 @@ export interface RevocationCheckOptions extends VerificationFetchOptions {
   maxStalenessMs?: number;
   /** Shared cache across calls. Defaults to a module-level cache; pass your own (e.g. `createRevocationCache()`) for isolation. */
   cache?: RevocationCache;
+  /** Cache for the list signer's identifier-binding check (spec §9.6/§9.7 via §8). Defaults to that module's own module-level cache; pass your own for isolation. */
+  bindingCache?: IdentifierBindingCache;
 }
 
 /**
@@ -225,12 +229,19 @@ function didWebOrigin(keyid: string): string | null {
   return url.origin;
 }
 
+/** SHA-256 output is exactly 32 bytes; a publicKeyHash that decodes to any other length (a hex-encoded hash, a truncated or padded value, ...) is malformed, not merely a different-looking valid hash. */
+function isValidPublicKeyHash(value: string): boolean {
+  if (!isCanonicalBase64(value)) return false;
+  const decoded = decodeCanonicalBase64(value);
+  return decoded !== null && decoded.byteLength === 32;
+}
+
 function isRevocationEntry(value: unknown): value is RevocationEntry {
   if (!value || typeof value !== "object") return false;
   const v = value as Record<string, unknown>;
   if (typeof v.keyid !== "string" || v.keyid === "") return false;
   if (v.status !== "revoked" && v.status !== "superseded") return false;
-  if (v.publicKeyHash !== undefined && (typeof v.publicKeyHash !== "string" || !isCanonicalBase64(v.publicKeyHash))) {
+  if (v.publicKeyHash !== undefined && (typeof v.publicKeyHash !== "string" || !isValidPublicKeyHash(v.publicKeyHash))) {
     return false;
   }
   // Spec §9.6: publicKeyHash is REQUIRED for a revoked entry; missing it is
@@ -389,8 +400,14 @@ function freshnessMsFor(res: Response, maxStaleness: number, defaultWhenAbsentMs
   const parseAgeDirective = (name: string): { present: boolean; seconds: number | null } => {
     for (const d of directives) {
       const eq = d.indexOf("=");
-      if (eq === -1) continue;
-      if (d.slice(0, eq).trim().toLowerCase() !== name) continue;
+      // A bare directive with no "=" (just "max-age", no value) is a
+      // different case from ABSENT: it names the directive but supplies no
+      // value, which is malformed, not missing -- treated as seconds: null
+      // (-> 0), same as any other unparseable value, not silently skipped
+      // as though the directive were never mentioned at all.
+      const directiveName = (eq === -1 ? d : d.slice(0, eq)).trim().toLowerCase();
+      if (directiveName !== name) continue;
+      if (eq === -1) return { present: true, seconds: null };
       const value = d.slice(eq + 1).trim();
       return { present: true, seconds: /^\d+$/.test(value) ? Number(value) : null };
     }
@@ -442,10 +459,15 @@ async function fetchList(
     return { outcome: "unknown", expiresAt: now + UNKNOWN_RETRY_MS };
   }
   if (res.status === 404) {
-    // Capped below the 24h ceiling: a publisher's first list after a
-    // compromise must not go unseen for up to a day just because an
-    // earlier 404 was cached generously (spec §9.9/§13.4).
-    return { outcome: "not-found", expiresAt: now + freshnessMsFor(res, maxStaleness, NOT_FOUND_DEFAULT_MS, now) };
+    // Capped at min(freshness lifetime, 1h) -- NOT_FOUND_DEFAULT_MS is
+    // used both as the fallback when no freshness header is present AND
+    // as a hard ceiling on any explicit freshness the server does supply
+    // (passed here as the "maxStaleness" freshnessMsFor caps against): an
+    // aggressive max-age on a 404 must not hide a publisher's first list
+    // after a compromise for the full 24h ceiling that would apply to a
+    // real 200 response (spec §9.9/§13.4).
+    const notFoundCap = Math.min(maxStaleness, NOT_FOUND_DEFAULT_MS);
+    return { outcome: "not-found", expiresAt: now + freshnessMsFor(res, notFoundCap, NOT_FOUND_DEFAULT_MS, now) };
   }
   if (!res.ok) {
     return { outcome: "unknown", expiresAt: now + UNKNOWN_RETRY_MS };
@@ -476,12 +498,32 @@ async function fetchList(
   } catch {
     return { outcome: "unknown", expiresAt: now + UNKNOWN_RETRY_MS };
   }
+  if (!resolved) {
+    return { outcome: "unknown", expiresAt: now + UNKNOWN_RETRY_MS };
+  }
+  // Spec §9.6/§9.7: the signer keyid is resolved under Section 8 in full,
+  // including the Section 8.2/8.1 identifier-binding requirement -- not
+  // just ordinary key resolution. A signer document that resolves but
+  // fails that binding (missing/mismatched kid, or a did:web document
+  // whose id does not match) makes the whole list malformed, the same as
+  // any other signer-resolution failure.
+  const signerBinding = await checkKeyIdentifierBinding(parsed.signer, {
+    fetch: options.fetch,
+    allowInsecureHttpForTesting: options.allowInsecureHttpForTesting,
+    sameOriginSourceRefetch: options.sameOriginSourceRefetch,
+    origin: options.origin,
+    now: options.now,
+    cache: options.bindingCache,
+  });
+  if (!signerBinding.ok) {
+    return { outcome: "unknown", expiresAt: now + UNKNOWN_RETRY_MS };
+  }
   // Spec §9.6/§9.1: the signer must be neither revoked nor superseded --
   // a superseded key MUST NOT sign new content, and this list is new
   // content. isKeyRevoked already covers "revoked" and the key-document-
   // derived flavor of "superseded" (superseded implies expired, which
   // isKeyRevoked already treats as revoked-for-verification purposes).
-  if (!resolved || isKeyRevoked(resolved)) {
+  if (isKeyRevoked(resolved)) {
     return { outcome: "unknown", expiresAt: now + UNKNOWN_RETRY_MS };
   }
 
